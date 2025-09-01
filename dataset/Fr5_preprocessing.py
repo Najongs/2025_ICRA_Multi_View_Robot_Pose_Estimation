@@ -33,16 +33,16 @@ CAMS = ['leftcam', 'rightcam']
 # 각 View의 기준 좌표계로부터 마커까지의 상대 위치 (단위: 미터)
 MARKER_OFFSETS = {
     "left": {
-        "1": np.array([0.095, -0.135, -0.0065]), "2": np.array([0.025, -0.135, -0.0065]), "3": np.array([-0.01, -0.295, -0.12]),
-        "4": np.array([0.095, -0.215, -0.0065]), "5": np.array([0.025, -0.215, -0.0065]), "6": np.array([-0.01, -0.375, -0.12]),
+        "1": np.array([0.095, -0.135, -0.01]), "2": np.array([0.025, -0.135, -0.01]), # "3": np.array([-0.01, -0.295, -0.12]),
+        "4": np.array([0.095, -0.215, -0.01]), "5": np.array([0.025, -0.215, -0.01]), # "6": np.array([-0.01, -0.375, -0.12]),
     },
     "right": {
-        "1": np.array([0.095, -0.135, -0.0065]), "2": np.array([0.025, -0.135, -0.0065]), "3": np.array([0.09, -0.375, -0.12]),
-        "4": np.array([0.095, -0.215, -0.0065]), "5": np.array([0.025, -0.215, -0.0065]), "6": np.array([0.09, -0.295, -0.12]),
+        "1": np.array([0.095, -0.135, -0.01]), "2": np.array([0.025, -0.135, -0.01]), # "3": np.array([0.09, -0.375, -0.12]),
+        "4": np.array([0.095, -0.215, -0.01]), "5": np.array([0.025, -0.215, -0.01]), # "6": np.array([0.09, -0.295, -0.12]),
     },
     "top": {
-        "1": np.array([0.095, -0.135, 0]), "2": np.array([0.025, -0.135, 0]), "3": np.array([-0.055, -0.135, 0]),
-        "4": np.array([0.095, -0.215, 0]), "5": np.array([0.025, -0.215, 0]), "6": np.array([-0.055, -0.215, 0]),
+        "1": np.array([0.095, -0.135, -0.01]), "2": np.array([0.025, -0.135, -0.01]), "3": np.array([-0.055, -0.165, -0.01]),
+        "4": np.array([0.095, -0.215, -0.01]), "5": np.array([0.025, -0.215, -0.01]), "6": np.array([-0.055, -0.245, -0.01]),
     }
 }
 
@@ -199,7 +199,10 @@ def calculate_and_visualize_poses():
     os.makedirs(SUMMARY_DIR, exist_ok=True)
     
     summary = []
-
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale_marker = 0.6
+    thickness_marker = 2
+    
     for view in VIEWS:
         serial = CAMERA_SERIALS[view]
         for cam in CAMS:
@@ -214,11 +217,27 @@ def calculate_and_visualize_poses():
 
             K = np.array(calib["camera_matrix"], dtype=np.float64)
             dist = np.array(calib["distortion_coeffs"], dtype=np.float64)
+            dist_coeffs_for_calc = np.zeros((5, 1))
+            
+            detected_marker_ids = set(poses.keys())
+            offset_marker_ids = set(MARKER_OFFSETS[view].keys())
+            
+            markers_to_use = detected_marker_ids.intersection(offset_marker_ids)
+            ignored_markers = detected_marker_ids - offset_marker_ids
+            
+            print(f"\nProcessing [{view}/{cam}]:")
+            print(f"  - Detected Markers: {sorted(list(detected_marker_ids))}")
+            if ignored_markers:
+                print(f"  - Ignored Markers (No Offset Defined): {sorted(list(ignored_markers))}")
+            if not markers_to_use:
+                print("  - No valid markers with defined offsets found. Skipping.")
+                continue
+            print(f"  - Markers to be Used for Calculation: {sorted(list(markers_to_use))}")
 
-            tvecs, rvecs, marker_ids = [], [], []
-            for mid, offset in MARKER_OFFSETS[view].items():
-                if mid not in poses:
-                    continue
+            
+            tvecs, quats, marker_ids = [], [], []
+            for mid in markers_to_use:
+                offset = MARKER_OFFSETS[view][mid]
                 p = poses[mid]
                 tvec = np.array([p["position_m"]["x"], p["position_m"]["y"], p["position_m"]["z"]])
                 quat = np.array([p["rotation_quat"][k] for k in ("x", "y", "z", "w")])
@@ -228,7 +247,7 @@ def calculate_and_visualize_poses():
                 tvec_with_offset = tvec + Rm @ offset
                 
                 tvecs.append(tvec_with_offset)
-                rvecs.append(R.from_quat(quat).as_rotvec())
+                quats.append(quat)
                 marker_ids.append(mid)
 
             if not tvecs:
@@ -236,8 +255,7 @@ def calculate_and_visualize_poses():
 
             # 모든 마커의 tvec과 rvec을 평균내어 최종 포즈 계산
             mean_tvec = np.mean(tvecs, axis=0)
-            all_quats = [R.from_rotvec(r).as_quat() for r in rvecs]
-            mean_quat = average_quaternion(all_quats)
+            mean_quat = average_quaternion(quats)
             mean_rvec = R.from_quat(mean_quat).as_rotvec()
             
             # --- 시각화 ---
@@ -249,20 +267,18 @@ def calculate_and_visualize_poses():
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
             # 개별 마커의 좌표축 그리기
-            for rvec, tvec, mid in zip(rvecs, [poses[mid] for mid in marker_ids], marker_ids):
-                pos = np.array([tvec['position_m']['x'], tvec['position_m']['y'], tvec['position_m']['z']])
-                cv2.drawFrameAxes(img_rgb, K, dist, rvec, pos.reshape(3, 1), 0.03)
-                
-                # 마커 ID 텍스트 표시
-                marker_pos_2d, _ = cv2.projectPoints(pos.reshape(1,3), np.zeros(3), np.zeros(3), K, dist)
-                x_marker, y_marker = map(int, marker_pos_2d.ravel())
-                cv2.putText(img_rgb, f"ID:{mid}", (x_marker + 10, y_marker - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-
+            for quat, tvec, mid in zip(quats, tvecs, marker_ids):
+                rot_vec = R.from_quat(quat).as_rotvec()
+                cv2.drawFrameAxes(img_rgb, K, dist_coeffs_for_calc, rot_vec, tvec.reshape(3, 1), 0.05)
+                marker_pos_2d, _ = cv2.projectPoints(tvec.reshape(1, 3), np.zeros((3,1)), np.zeros((3,1)), K, dist_coeffs_for_calc)
+                x_marker, y_marker = marker_pos_2d.ravel().astype(int)
+                cv2.putText(img_rgb, f"ID:{mid}", (x_marker + 10, y_marker - 10), font, font_scale_marker, (255, 255, 0), thickness_marker)
+            
             # 평균 좌표계 시각화 (더 크게)
-            cv2.drawFrameAxes(img_rgb, K, dist, mean_rvec.reshape(3, 1), mean_tvec.reshape(3, 1), 0.05)
+            cv2.drawFrameAxes(img_rgb, K, dist_coeffs_for_calc, mean_rvec.reshape(3, 1), mean_tvec.reshape(3, 1), 0.05)
             
             # 평균 위치 텍스트 표시
-            mean_pos_2d, _ = cv2.projectPoints(mean_tvec.reshape(1,3), np.zeros(3), np.zeros(3), K, dist)
+            mean_pos_2d, _ = cv2.projectPoints(mean_tvec.reshape(1,3), np.zeros(3), np.zeros(3), K, dist_coeffs_for_calc)
             xm, ym = map(int, mean_pos_2d.ravel())
             cv2.drawMarker(img_rgb, (xm, ym), (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
             
@@ -285,12 +301,13 @@ def calculate_and_visualize_poses():
             print(f"결과 이미지 저장 완료: {output_image_path}")
 
             # 요약 정보 추가
-            summary.append([view, cam, *mean_tvec, *mean_rvec])
-
+            summary.append([view, cam, *mean_tvec, *mean_rvec, xm, ym])
+            print(f"{marker_ids}, {tvecs}, {quats}")
+            
     # 최종 결과 요약 저장
-    columns = ["view", "cam", "tvec_x", "tvec_y", "tvec_z", "rvec_x", "rvec_y", "rvec_z"]
+    columns = ["view", "cam", "tvec_x", "tvec_y", "tvec_z", "rvec_x", "rvec_y", "rvec_z", 'projected_x', 'projected_y']
     df = pd.DataFrame(summary, columns=columns)
-    summary_path = "Fr5_aruco_pose_summary.json"
+    summary_path = "./Fr5/Fr5_aruco_pose_summary.json"
     df.to_json(summary_path, orient="records", indent=2)
 
     print(f"\n최종 포즈 요약 파일이 '{summary_path}'에 저장되었습니다.")
