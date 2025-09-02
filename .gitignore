@@ -14,6 +14,7 @@ __pycache__/
 
 dinov3/
 DINOv3/
+wandb/
 
 DREAM_real/
 Fr5/
