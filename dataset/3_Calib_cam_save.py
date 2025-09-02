@@ -6,11 +6,13 @@ import numpy as np
 camera_list = {
     30779426: "top",
     34850673: "right",
-    38007749: "left"
+    38007749: "left",
+    30695000: "top"
 }
 
 zed_conf_dir = "./All_camera_conf"
 output_dir = "./Fr5/Calib_cam_from_conf"
+os.makedirs(output_dir, exist_ok=True)
 
 def load_fhd_calibration(conf_path, side):
     config = configparser.ConfigParser()
