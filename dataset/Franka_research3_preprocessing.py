@@ -40,10 +40,10 @@ CAMS = ['leftcam', 'rightcam']
 
 # --- Marker Offset Settings ---
 MARKER_OFFSETS = {
-    "view1": {"1": [0.025, 0.20, -0.01], "2": [-0.175, 0.0, -0.01], "4": [-0.30, 0.0, -0.01], "5": [0.35, 0.0, -0.01], "6": [0.025, 0.325, -0.01]},
-    "view2": {"2": [-0.175, 0.0, -0.01], "4": [-0.30, 0.00, -0.01], "7": [0.025, -0.225, -0.01], "8": [0.025, -0.325, -0.01]},
-    "view3": {"3": [0.225, 0.0, -0.01], "5": [0.35, 0.0, -0.01], "7": [0.025, -0.225, -0.01], "8": [0.025, -0.325, -0.01]},
-    "view4": {"1": [0.025, 0.20, -0.01], "2": [-0.175, 0.0, -0.01], "4": [-0.30, 0.01, -0.01], "6": [0.025, 0.325, -0.01], "7": [0.025, -0.225, -0.01], "8": [0.025, -0.325, -0.01]}
+    "view1": {"2": [-0.175, 0.0, -0.045], "4": [-0.30, 0.0, -0.045], "6": [0.025, 0.325, -0.045]},
+    "view2": {"2": [-0.15, 0.0, -0.1], "4": [-0.275, 0.0, -0.1], "7": [0.05, -0.225, -0.1], "8": [0.05, -0.325, -0.1]},
+    "view3": {"3": [0.225, 0.05, -0.045],  "5": [0.35, 0.05, -0.045],  "7": [0.025, -0.175, -0.045], "8": [0.025, -0.275, -0.045]},
+    "view4": {"2": [-0.175, 0.025, -0.045], "4": [-0.30, 0.025, -0.045],"8": [0.025, -0.3, -0.045]}
 }
 # Convert offsets to numpy arrays
 for view_key, markers in MARKER_OFFSETS.items():
@@ -111,27 +111,43 @@ def correct_aruco_data(input_base_dir, output_dir):
                 print(f"    [DEBUG]   - Marker ID {marker_id}: Found {len(entries)} initial detections.")
                 
                 positions = [np.array([m['position_m'][k] for k in 'xyz']) for m in entries]
-                quaternions = [np.array([m['rotation_quat'][k] for k in 'xyzw']) for m in entries]
+                quaternions = np.array([np.array([m['rotation_quat'][k] for k in 'xyzw']) for m in entries])
 
-                aligned_quats = align_quaternions(np.array(quaternions))
+                # 💡 1. 쿼터니언을 맨 처음에 한 번만 정렬합니다.
+                aligned_quats = align_quaternions(quaternions)
+                
+                # ✨ [DEBUG] Print initial detection count
+                print(f" [DEBUG]  - Marker ID {marker_id}: Found {len(entries)} initial detections.")
+                
+                # 💡 2. 정렬된 쿼터니언으로 초기 평균을 계산합니다.
                 avg_quat_initial = average_quaternion(aligned_quats)
+                if avg_quat_initial is None: continue
 
-                # Filter outliers based on angular distance
-                filtered_pos = [p for p, q in zip(positions, quaternions) if angular_distance_deg(avg_quat_initial, q) <= 2.0]
-                filtered_quat = [q for q in quaternions if angular_distance_deg(avg_quat_initial, q) <= 2.0]
+                # 💡 3. 필터링 시에도 정렬된 쿼터니언을 사용합니다. (일관성 유지)
+                #    (angular_distance_deg 함수는 q와 -q를 동일하게 처리하므로 원본을 써도 무방하지만,
+                #     코드를 명확하게 하기 위해 정렬된 버전을 사용하는 것이 좋습니다.)
+                filtered_indices = [i for i, q in enumerate(aligned_quats) if angular_distance_deg(avg_quat_initial, q) <= 2.0]
                 
+                if not filtered_indices:
+                    print(f" [DEBUG]   - Marker ID {marker_id}: No detections kept after filtering.")
+                    continue
+                    
+                filtered_pos = [positions[i] for i in filtered_indices]
+                filtered_quat = [aligned_quats[i] for i in filtered_indices]
+
                 # ✨ [DEBUG] Print detection count after filtering
-                print(f"    [DEBUG]   - Marker ID {marker_id}: Kept {len(filtered_pos)} detections after filtering (threshold: 2.0 deg).")
+                print(f" [DEBUG] - Marker ID {marker_id}: Kept {len(filtered_pos)} detections after filtering (threshold: 2.0 deg).")
 
-                if not filtered_pos: continue
-                
+                # 💡 4. 이미 정렬된 필터링 결과를 사용하므로, 다시 정렬할 필요가 없습니다.
                 avg_pos = average_position(filtered_pos)
-                avg_quat = average_quaternion(align_quaternions(np.array(filtered_quat)))
+                avg_quat = average_quaternion(np.array(filtered_quat))
                 
+                if avg_quat is None: continue
+
                 corrected[marker_id] = {
                     "position_m": {k: float(v) for k, v in zip('xyz', avg_pos)},
                     "rotation_quat": {k: float(v) for k, v in zip('xyzw', avg_quat)},
-                    "corners_pixel": entries[0]["corners_pixel"] # Keep first corner data as representative
+                    "corners_pixel": entries[0]["corners_pixel"]
                 }
             
             if corrected:
@@ -216,8 +232,16 @@ def calculate_and_visualize_poses(pose_name, corrected_json_dir, image_base_dir)
             if not tvecs: continue
             
             mean_tvec = average_position(np.array(tvecs))
-            mean_quat = average_quaternion(np.array(quats))
-            mean_rvec = R.from_quat(mean_quat).as_rotvec()
+            aligned_quats = align_quaternions(np.array(quats))
+            mean_quat = average_quaternion(aligned_quats)
+
+            # mean_quat이 None이 아닌 경우에만 rvec으로 변환 (오류 방지)
+            if mean_quat is not None:
+                mean_rvec = R.from_quat(mean_quat).as_rotvec()
+            else:
+                # 쿼터니언 평균 계산 실패 시, 처리를 건너뛰거나 기본값을 사용
+                print(f"    [WARNING] Could not compute average quaternion for {view}/{cam}. Skipping.")
+                continue
             
             # --- Visualization ---
             image_dir_list = glob.glob(os.path.join(image_base_dir, "ArUco_capture_dataset_*"))
