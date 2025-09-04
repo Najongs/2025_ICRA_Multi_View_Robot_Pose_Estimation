@@ -1,334 +1,387 @@
-# -*- coding: utf-8 -*-
-"""
-ArUco 마커 데이터를 처리하여 최종 객체 자세를 추정하고 결과를 요약, 시각화하는 스크립트.
-
-실행 순서:
-1. 여러 세션에서 캡처된 Raw 데이터의 노이즈를 제거하고 평균을 계산합니다.
-2. 평균낸 마커 코너 좌표를 사용하여 카메라 보정값 기준으로 자세를 다시 계산합니다.
-3. 각 마커의 오프셋을 적용하여 최종 객체 중심의 자세를 추정하고, 이를 시각화하여 이미지 파일로 저장하며,
-   모든 결과를 종합하여 JSON 파일로 출력합니다.
-"""
 import os
 import glob
 import json
 import cv2
 import numpy as np
+from collections import defaultdict
+from scipy.spatial.transform import Rotation as R
 import pandas as pd
 import matplotlib.pyplot as plt
 import configparser
-from collections import defaultdict
-from scipy.spatial.transform import Rotation as R
 
 # =================================================================================
-# 1. 통합 설정 (Configuration)
+# 통합 설정 (변경 없음)
 # =================================================================================
-
-# --- Raw 데이터 경로 설정 ---
+# --- 1단계 설정: Raw 데이터 경로 ---
 RAW_DATA_DIRS = [
-    "./Meca_insertion/Meca_ArUco/ArUco_cap_250514",
+    "./Meca_insertion/Meca_ArUco/ArUco_cap1_250514",
     "./Meca_insertion/Meca_ArUco/ArUco_cap2_250514",
     "./Meca_insertion/Meca_ArUco/ArUco_cap3_250514"
 ]
-
-# --- 보정 및 시각화 관련 경로 설정 ---
+# --- 2단계 설정: Pose 재계산용 ---
+MARKER_REAL_SIZE_M = 0.05
+# --- 3단계 설정: 시각화 및 최종 오프셋 ---
 CALIB_DIR = "./Meca_insertion/Meca_calib_cam_from_conf"
-ZED_CONF_DIR = "./All_camera_conf"
-IMAGE_DIR = "./Meca_insertion/Meca_ArUco/ArUco_cap_250514"  # 시각화에 사용할 대표 이미지 경로
-RESULTS_IMAGE_DIR = "./Meca_insertion/Meca_calib_results_images"  # ★★★ 결과 이미지 저장 폴더
-FINAL_SUMMARY_OUTPUT_PATH = "./Meca_insertion/aruco_final_summary.json"
+STEREO_CONF_DIR = "./All_camera_conf"
+IMAGE_DIR = "./Meca_insertion/Meca_ArUco/ArUco_cap1_250514"
+FINAL_SUMMARY_OUTPUT_PATH = "./Meca_insertion/Meca_insertion_aruco_final_summary.json"
 
-# --- 파라미터 설정 ---
-MARKER_REAL_SIZE_M = 0.05  # ArUco 마커의 실제 한 변 길이 (미터 단위)
-
-# --- 카메라 및 뷰 매핑 정보 ---
-camera_serials = {"front": 41182735, "right": 49429257, "left": 44377151, "top": 49045152}
-camera_list = {v: k for k, v in camera_serials.items()} # serial: position 형태의 역방향 맵
+camera_serials = {"front":41182735, "right":49429257, "left":44377151, "top":49045152}
 views = ['front', 'left', 'right', 'top']
 cams = ['leftcam', 'rightcam']
 
-# --- 최종 객체 자세 추정을 위한 마커 오프셋 (객체 중심 기준 마커 위치) ---
 marker_offsets = {
-    "front": {"1": np.array([-0.100, 0.125, 0.0065]), "2": np.array([-0.100, 0.025, 0.0065]), "3": np.array([0, -0.175, 0.0065]), "4": np.array([-0.100, -0.075, 0.0065]), "5": np.array([0.125, 0.025, 0.0065]), "6": np.array([0.125, 0.125, 0.0065]), "7": np.array([0, -0.075, 0.0065]), "8": np.array([0.125, -0.075, 0.0065])},
-    "left": {"3": np.array([0, -0.175, 0.0065]), "4": np.array([-0.100, -0.075, 0.0065]), "5": np.array([0.125, 0.025, 0.0065]), "6": np.array([0.125, 0.125, 0.0065]), "7": np.array([0.000, -0.075, 0.0065]), "8": np.array([0.125, -0.075, 0.0065])},
-    "right": {"1": np.array([-0.100, 0.125, 0.0065]), "2": np.array([-0.100, 0.025, 0.0065]), "3": np.array([0.000, -0.175, 0.0065]), "4": np.array([-0.100, -0.075, 0.0065]), "7": np.array([0.000, -0.075, 0.0065]), "8": np.array([0.125, -0.075, 0.0065])},
-    "top": {"1": np.array([-0.100, 0.125, 0.0065]), "2": np.array([-0.100, 0.025, 0.0065]), "3": np.array([0, -0.175, 0.0065]), "4": np.array([-0.100, -0.075, 0.0065]), "5": np.array([0.125, 0.025, 0.0065]), "6": np.array([0.125, 0.125, 0.0065]), "7": np.array([0, -0.075, 0.0065]), "8": np.array([0.125, -0.075, 0.0065])},
+    "front": { "1": np.array([-0.100, 0.125, 0.0065]), "2": np.array([-0.100, 0.025, 0.0065]), "3": np.array([0, -0.175, 0.0065]), "4": np.array([-0.100, -0.075, 0.0065]), "5": np.array([0.125, 0.025, 0.0065]), "6": np.array([0.125, 0.125, 0.0065]), "7": np.array([0, -0.075, 0.0065]), "8": np.array([0.125, -0.075, 0.0065]) },
+    "left": { "3": np.array([0, -0.175, 0.0065]), "4": np.array([-0.100, -0.075, 0.0065]), "5": np.array([0.125, 0.025, 0.0065]), "6": np.array([0.125, 0.125, 0.0065]), "7": np.array([0.000, -0.075, 0.0065]), "8": np.array([0.125, -0.075, 0.0065]) },
+    "right": { "1": np.array([-0.100, 0.125, 0.0065]), "2": np.array([-0.100, 0.025, 0.0065]), "3": np.array([0.000, -0.175, 0.0065]), "4": np.array([-0.100, -0.075, 0.0065]), "7": np.array([0.000, -0.075, 0.0065]), "8": np.array([0.125, -0.075, 0.0065]) },
+    "top": { "1": np.array([-0.100, 0.125, 0.0065]), "2": np.array([-0.100, 0.025, 0.0065]), "3": np.array([0, -0.175, 0.0065]), "4": np.array([-0.100, -0.075, 0.0065]), "5": np.array([0.125, 0.025, 0.0065]), "6": np.array([0.125, 0.125, 0.0065]), "7": np.array([0, -0.075, 0.0065]), "8": np.array([0.125, -0.075, 0.0065]) },
 }
 
 # =================================================================================
-# 2. 헬퍼 함수 (Helper Functions)
+# 헬퍼 함수
 # =================================================================================
+def load_stereo_config(serial):
+    conf_path = os.path.join(STEREO_CONF_DIR, f"SN{serial}.conf")
+    if not os.path.exists(conf_path):
+        # ❌ 파일 없음 메시지 추가
+        print(f"    ❌ [STEREO] Config file not found: {conf_path}")
+        return None
+
+    config = configparser.ConfigParser()
+    config.read(conf_path, encoding='utf-8-sig')
+    
+    try:
+        params = {
+            'baseline': config.getfloat('STEREO', 'Baseline'),
+            'ty': config.getfloat('STEREO', 'TY'),
+            'tz': config.getfloat('STEREO', 'TZ'),
+            'rx': config.getfloat('STEREO', 'RX_FHD1200'),
+            'ry': config.getfloat('STEREO', 'CV_FHD1200'),
+            'rz': config.getfloat('STEREO', 'RZ_FHD1200')
+        }
+        # ✅ 성공 메시지 추가
+        print(f"    ✅ [STEREO] Successfully loaded stereo config for SN {serial}.")
+        return params
+    except (configparser.NoSectionError, configparser.NoOptionError) as e:
+        # ❌ 오류 메시지 추가
+        print(f"    ❌ [STEREO] Error reading config file {conf_path}: {e}")
+        return None
+
+# (다른 헬퍼 함수들은 변경 없음)
 def parse_filename(filename):
-    """파일 이름에서 view와 cam 정보를 추출합니다."""
-    parts = os.path.basename(filename).split('_')
-    view = parts[0]
-    cam = parts[2]
+    parts = filename.split('_')
+    view, cam = parts[0], parts[2]
     return view, cam
 
 def average_quaternion(quaternions):
-    """쿼터니언 배열의 평균을 계산합니다."""
-    if len(quaternions) == 0: return np.array([0, 0, 0, 1])
-    # Scipy의 Rotation 객체를 사용하여 평균 계산
+    if len(quaternions) == 0: return np.array([0,0,0,1])
     return R.from_quat(quaternions).mean().as_quat()
 
 def average_position(positions):
-    """3D 좌표 배열의 평균을 계산합니다."""
-    if len(positions) == 0: return np.array([0, 0, 0])
+    if len(positions) == 0: return np.array([0,0,0])
     return np.mean(positions, axis=0)
 
 def remove_outliers(positions, quaternions, pos_thresh=0.001, rot_thresh_deg=3):
-    """위치 및 회전 데이터에서 이상치를 제거합니다."""
     if len(positions) < 2: return positions, quaternions, np.ones(len(positions), dtype=bool)
-    
-    avg_pos = average_position(positions)
-    avg_quat = average_quaternion(quaternions)
-    
-    # 위치 이상치 제거
+    avg_pos, avg_quat = average_position(positions), average_quaternion(quaternions)
     pos_dists = np.linalg.norm(positions - avg_pos, axis=1)
     pos_mask = pos_dists < pos_thresh
-    
-    # 회전 이상치 제거 (평균 회전과의 각도 차이 기준)
     avg_rot = R.from_quat(avg_quat)
     angular_distances = np.array([np.rad2deg((avg_rot.inv() * R.from_quat(q)).magnitude()) for q in quaternions])
     rot_mask = angular_distances < rot_thresh_deg
-    
     valid_mask = pos_mask & rot_mask
     return positions[valid_mask], quaternions[valid_mask], valid_mask
 
-# =================================================================================
-# 3. 주요 처리 함수 (Core Logic Functions)
-# =================================================================================
+# 헬퍼 함수 섹션에 추가할 시각화 함수
+def save_visualization_image(view, cam, image_path, K, dist, poses, marker_offsets, final_pose, output_dir):
+    """
+    계산된 자세 정보를 이미지에 시각화하여 지정된 경로에 파일로 저장합니다.
 
-def generate_calibration_files():
-    """ZED SDK의 .conf 파일에서 카메라 보정 정보를 읽어 JSON 파일로 저장합니다."""
-    print("--- Running Calibration File Generation ---")
-    os.makedirs(CALIB_DIR, exist_ok=True)
-    
-    def load_fhd_calibration(conf_path, side):
-        config = configparser.ConfigParser()
-        with open(conf_path, "r", encoding="utf-8-sig") as f:
-            config.read_file(f)
-        
-        section = f"{side.upper()}_CAM_FHD1200"
-        cam = config[section]
-        
-        camera_matrix = [[float(cam["fx"]), 0.0, float(cam["cx"])],
-                         [0.0, float(cam["fy"]), float(cam["cy"])],
-                         [0.0, 0.0, 1.0]]
-        distortion_coeffs = [float(cam[k]) for k in ["k1", "k2", "p1", "p2", "k3"]]
-        
-        return camera_matrix, distortion_coeffs
-
-    for serial, position in camera_list.items():
-        conf_path = os.path.join(ZED_CONF_DIR, f"SN{serial}.conf")
-        if not os.path.exists(conf_path):
-            print(f"[{position}] Warning: Config file not found: {conf_path}")
-            continue
-
-        for side, side_name in [("LEFT", "leftcam"), ("RIGHT", "rightcam")]:
-            try:
-                cam_matrix, dist_coeffs = load_fhd_calibration(conf_path, side)
-                data = {"camera_matrix": cam_matrix, "distortion_coeffs": dist_coeffs}
-                filename = f"{position}_{serial}_{side_name}_calib.json"
-                with open(os.path.join(CALIB_DIR, filename), "w") as f:
-                    json.dump(data, f, indent=4)
-                print(f"[{position}] Calibration saved: {filename}")
-            except Exception as e:
-                print(f"[{position}] Error processing {side_name}: {e}")
-    print("--- Calibration File Generation Complete ---\n")
-
-
-def process_raw_data():
-    """STAGE 1: Raw 데이터를 읽어 이상치를 제거하고 평균값을 계산합니다."""
-    print("--- STAGE 1: Averaging Raw Data and Removing Outliers ---")
-    raw_data = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    for base_dir in RAW_DATA_DIRS:
-        for fname in glob.glob(os.path.join(base_dir, '*.json')):
-            view, cam = parse_filename(fname)
-            with open(fname, 'r') as f:
-                content = json.load(f)
-                for marker_id, marker_data in content.items():
-                    if "corners_pixel" in marker_data:
-                        raw_data[view][cam][marker_id].append(marker_data)
-
-    corrected_data = defaultdict(lambda: defaultdict(dict))
-    for view, cams_data in raw_data.items():
-        for cam, markers_data in cams_data.items():
-            for marker_id, entries in markers_data.items():
-                if len(entries) < 2:
-                    corrected_data[view][cam][marker_id] = entries[0]
-                    continue
-                
-                positions = np.array([[m['position_m'][k] for k in 'xyz'] for m in entries])
-                quaternions = np.array([[m['rotation_quat'][k] for k in 'xyzw'] for m in entries])
-                corners = np.array([m['corners_pixel'] for m in entries], dtype=np.float32)
-
-                pos_f, quat_f, mask = remove_outliers(positions, quaternions)
-                
-                if len(pos_f) == 0 or len(pos_f) < len(entries) / 2:
-                    print(f"Warning: Marker {marker_id} in {view}_{cam} excluded due to excessive outliers.")
-                    continue
-
-                corrected_data[view][cam][marker_id] = {
-                    "position_m": dict(zip('xyz', average_position(pos_f))),
-                    "rotation_quat": dict(zip('xyzw', average_quaternion(quat_f))),
-                    "corners_pixel": np.mean(corners[mask], axis=0).tolist()
-                }
-    print("--- STAGE 1 Complete ---\n")
-    return corrected_data
-
-
-def recalculate_poses(stage1_data):
-    """STAGE 2: Stage 1의 평균 코너 좌표를 이용해 Pose를 다시 계산합니다."""
-    print("--- STAGE 2: Recalculating Pose from Averaged Corners ---")
-    marker_3d_points = np.array([
-        [0, 0, 0], [MARKER_REAL_SIZE_M, 0, 0], 
-        [MARKER_REAL_SIZE_M, MARKER_REAL_SIZE_M, 0], [0, MARKER_REAL_SIZE_M, 0]
-    ], dtype=np.float32)
-
-    recalculated_data = defaultdict(lambda: defaultdict(dict))
-    for view, cams_data in stage1_data.items():
-        for cam, markers_data in cams_data.items():
-            serial = camera_serials.get(view)
-            if not serial: continue
-            
-            calib_path = os.path.join(CALIB_DIR, f"{view}_{serial}_{cam}_calib.json")
-            if not os.path.exists(calib_path): continue
-            
-            with open(calib_path) as f: calib_data = json.load(f)
-            camera_matrix = np.array(calib_data["camera_matrix"], dtype=np.float64)
-            dist_coeffs = np.array(calib_data["distortion_coeffs"], dtype=np.float64)
-
-            for marker_id, data in markers_data.items():
-                corners_2d = np.array(data["corners_pixel"], dtype=np.float32).reshape((4, 1, 2))
-                ret, rvec, tvec = cv2.solvePnP(marker_3d_points, corners_2d, camera_matrix, dist_coeffs)
-                if not ret: continue
-                
-                # Refine the pose
-                rvec, tvec = cv2.solvePnPRefineLM(marker_3d_points, corners_2d, camera_matrix, dist_coeffs, rvec, tvec)
-                
-                quat = R.from_rotvec(rvec.flatten()).as_quat()
-                recalculated_data[view][cam][marker_id] = {
-                    "position_m": dict(zip('xyz', tvec.flatten())),
-                    "rotation_quat": dict(zip('xyzw', quat)),
-                    "corners_pixel": data["corners_pixel"]
-                }
-    print("--- STAGE 2 Complete ---\n")
-    return recalculated_data
-
-
-def summarize_and_visualize(stage2_data):
-    """STAGE 3: 최종 오프셋 적용, 시각화 및 요약 파일을 생성합니다."""
-    print("--- STAGE 3: Applying Final Offsets, Visualizing, and Summarizing ---")
-    final_summary = []
+    Args:
+        view (str): 'front', 'left' 등 현재 뷰 이름
+        cam (str): 'leftcam' 또는 'rightcam'
+        image_path (str): 시각화의 바탕이 될 원본 이미지 경로
+        K (np.array): 카메라 매트릭스
+        dist (np.array): 왜곡 계수
+        poses (dict): Stage 2에서 계산된 개별 마커들의 자세 정보
+        marker_offsets (dict): 마커 오프셋 설정값
+        final_pose (dict): 최종 계산된 평균 객체 자세 {'rvec': ..., 'tvec': ...}
+        output_dir (str): 이미지를 저장할 폴더 경로
+    """
     font = cv2.FONT_HERSHEY_SIMPLEX
+    
+    # 1. 이미지 로드 및 왜곡 보정
+    img = cv2.imread(image_path)
+    undistorted_img = cv2.undistort(img, K, dist, None, K)
 
-    for view in views:
-        for cam in cams:
-            poses = stage2_data.get(view, {}).get(cam)
-            if not poses: continue
+    # 2. 개별 마커들의 자세 시각화 (축 및 ID)
+    for mid, offset in marker_offsets.get(view, {}).items():
+        if mid in poses and mid != "8":
+            p = poses[mid]
+            tvec = np.array(list(p["position_m"].values()))
+            quat = np.array(list(p["rotation_quat"].values()))
+            rvec = R.from_quat(quat).as_rotvec()
             
-            serial = camera_serials.get(view)
-            calib_path = os.path.join(CALIB_DIR, f"{view}_{serial}_{cam}_calib.json")
-            img_files = glob.glob(os.path.join(IMAGE_DIR, f"{view}_*_{cam}_*.png"))
-            if not os.path.exists(calib_path) or not img_files: continue
+            # 각 마커의 좌표축 그리기
+            cv2.drawFrameAxes(undistorted_img, K, None, rvec, tvec.reshape(3, 1), 0.05)
+            
+            # 마커 ID 텍스트 표시
+            marker_pos_2d, _ = cv2.projectPoints(tvec.reshape(1, 3), np.zeros(3), np.zeros(3), K, None)
+            cv2.putText(undistorted_img, f"ID:{mid}", tuple(marker_pos_2d.ravel().astype(int)), font, 0.6, (255, 255, 0), 2)
 
+    # 3. 최종 평균 자세 시각화 (축 및 중심점)
+    mean_rvec = final_pose['rvec']
+    mean_tvec = final_pose['tvec']
+    
+    # 최종 객체의 좌표축 그리기 (더 굵게)
+    cv2.drawFrameAxes(undistorted_img, K, None, mean_rvec, mean_tvec, 0.1, thickness=4)
+    
+    # 최종 객체의 중심점 마커 그리기
+    mean_proj, _ = cv2.projectPoints(mean_tvec.reshape(1, 3), np.zeros(3), np.zeros(3), K, None)
+    xm, ym = mean_proj.ravel().astype(int)
+    cv2.drawMarker(undistorted_img, (xm, ym), (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
+
+    # 4. Matplotlib을 사용하여 이미지 파일로 저장
+    plt.figure(figsize=(12, 9))
+    # OpenCV의 BGR 색상 순서를 Matplotlib의 RGB 순서로 변환
+    plt.imshow(cv2.cvtColor(undistorted_img, cv2.COLOR_BGR2RGB))
+    plt.title(f"Final Mean Pose ({view.upper()}-{cam})")
+    plt.axis('off')
+    plt.tight_layout()
+    
+    # 파일 저장 및 리소스 정리
+    output_path = os.path.join(output_dir, f"{view}_{cam}_pose_visualization.png")
+    plt.savefig(output_path)
+    plt.close() # 메모리 누수 방지를 위해 창을 닫아줍니다.
+    print(f"✅ Visualization saved to: {output_path}")
+
+# =================================================================================
+# 메인 로직
+# =================================================================================
+
+# --- 1단계: 이상치 제거 및 평균 계산 ---
+print("--- STAGE 1: Averaging Raw Data and Removing Outliers ---")
+raw_data = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+total_files_found = 0
+for base_dir in RAW_DATA_DIRS:
+    for fname in os.listdir(base_dir):
+        if not fname.endswith('.json'): continue
+        total_files_found += 1 # ✅ 파일 카운트
+        view, cam = parse_filename(fname)
+        with open(os.path.join(base_dir, fname), 'r') as f:
+            content = json.load(f)
+            for marker_id, marker_data in content.items():
+                if "corners_pixel" in marker_data:
+                    raw_data[view][cam][marker_id].append(marker_data)
+# ✅ 로드된 파일 수 정보 출력
+print(f"🔍 [INFO] Found and processed {total_files_found} raw JSON files.")
+
+corrected_data_stage1 = defaultdict(lambda: defaultdict(dict))
+# (Stage 1의 나머지 부분은 변경 없음)
+for view in raw_data:
+    for cam in raw_data[view]:
+        for marker_id, entries in raw_data[view][cam].items():
+            if len(entries) < 2:
+                if entries: corrected_data_stage1[view][cam][marker_id] = entries[0]
+                continue
+            
+            positions = np.array([[m['position_m'][k] for k in 'xyz'] for m in entries])
+            quaternions = np.array([[m['rotation_quat'][k] for k in 'xyzw'] for m in entries])
+            corners = np.array([m['corners_pixel'] for m in entries], dtype=np.float32)
+
+            positions_filtered, quats_filtered, mask = remove_outliers(positions, quaternions)
+            
+            if len(positions_filtered) == 0 or len(positions_filtered) < len(entries) / 2:
+                continue
+
+            avg_pos = average_position(positions_filtered)
+            avg_quat = average_quaternion(quats_filtered)
+            avg_corners = np.mean(corners[mask], axis=0)
+            
+            corrected_data_stage1[view][cam][marker_id] = {
+                "position_m": dict(zip('xyz', avg_pos)),
+                "rotation_quat": dict(zip('xyzw', avg_quat)),
+                "corners_pixel": avg_corners.tolist()
+            }
+print("--- STAGE 1 Complete ---\n")
+
+
+# --- 2단계: Top-Left 기준 Pose 재계산 ---
+print("--- STAGE 2: Recalculating Pose from Top-Left Corner ---")
+marker_3d_points = np.array([
+    [0, 0, 0], [MARKER_REAL_SIZE_M, 0, 0], [MARKER_REAL_SIZE_M, MARKER_REAL_SIZE_M, 0], [0, MARKER_REAL_SIZE_M, 0]
+], dtype=np.float32)
+recalculated_data_stage2 = defaultdict(lambda: defaultdict(dict))
+
+for view in corrected_data_stage1:
+    for cam in corrected_data_stage1[view]:
+        serial = camera_serials.get(view)
+        if not serial: continue
+        calib_path = os.path.join(CALIB_DIR, f"{view}_{serial}_{cam}_calib.json")
+        
+        # ✅ 캘리브레이션 파일 존재 여부 확인 및 메시지 출력
+        if not os.path.exists(calib_path):
+            print(f"  ❌ [CALIB] Calibration file not found for {view}_{cam}. Skipping.")
+            continue
+        print(f"  ✅ [CALIB] Found calibration for {view}_{cam}.")
+            
+        with open(calib_path) as f: calib_data = json.load(f)
+        camera_matrix = np.array(calib_data["camera_matrix"], dtype=np.float64)
+        dist_coeffs = np.array(calib_data["distortion_coeffs"], dtype=np.float64)
+
+        for marker_id, data in corrected_data_stage1[view][cam].items():
+            corners_2d = np.array(data["corners_pixel"], dtype=np.float32)
+            try:
+                ret, rvec, tvec = cv2.solvePnP(marker_3d_points, corners_2d, camera_matrix, dist_coeffs)
+            except ValueError:
+                ret, rvec, tvec, _ = cv2.solvePnP(marker_3d_points, corners_2d, camera_matrix, dist_coeffs, useExtrinsicGuess=False, flags=cv2.SOLVEPNP_IPPE)
+
+            if not ret: continue
+            
+            rvec, tvec = cv2.solvePnPRefineLM(marker_3d_points, corners_2d, camera_matrix, dist_coeffs, rvec, tvec)
+            new_position = {"x": tvec[0][0], "y": tvec[1][0], "z": tvec[2][0]}
+            quat = R.from_rotvec(rvec.flatten()).as_quat()
+            new_rotation = dict(zip('xyzw', quat))
+            
+            recalculated_data_stage2[view][cam][marker_id] = {
+                "position_m": new_position, "rotation_quat": new_rotation, "corners_pixel": data["corners_pixel"]
+            }
+print("--- STAGE 2 Complete ---\n")
+
+
+# --- 3단계: 최종 오프셋 적용, 시각화 및 요약 ---
+print("--- STAGE 3: Applying Final Offsets, Summarizing, and Visualizing ---")
+final_summary = []
+RESULTS_IMAGE_DIR = "./Meca_insertion/Meca_calib_results_images" # 이미지 저장 폴더 설정
+
+# 스크립트 시작 시 결과 폴더가 없으면 생성
+os.makedirs(RESULTS_IMAGE_DIR, exist_ok=True)
+
+for view in views:
+    print(f"\nProcessing View: {view.upper()}")
+    left_cam_final_pose = None
+    
+    # --- 1. LEFTCAM 처리 ---
+    cam = 'leftcam'
+    poses = recalculated_data_stage2.get(view, {}).get(cam)
+    if poses:
+        serial = camera_serials.get(view)
+        calib_path = os.path.join(CALIB_DIR, f"{view}_{serial}_{cam}_calib.json")
+        img_files = glob.glob(os.path.join(IMAGE_DIR, f"{view}_*_{cam}_*.png"))
+
+        if os.path.exists(calib_path) and img_files:
+            print(f"  [LEFTCAM] Processing... Found calib and {len(img_files)} image file(s).")
             with open(calib_path) as f: calib = json.load(f)
-            K = np.array(calib["camera_matrix"], dtype=np.float64)
-            dist = np.array(calib["distortion_coeffs"], dtype=np.float64)
+            K, dist = np.array(calib["camera_matrix"]), np.array(calib["distortion_coeffs"])
             
-            img = cv2.imread(img_files[0])
-            undistorted_img = cv2.undistort(img, K, dist, None, K)
-            
-            offset_positions, all_quats, valid_ids = [], [], []
-
+            # 계산 로직 (기존과 동일)
+            offset_applied_positions, all_quaternions = [], []
             for mid, offset in marker_offsets.get(view, {}).items():
-                if mid not in poses or mid == "8": continue  # ID 8은 제외 (설정에 따라 변경 가능)
-                
-                p = poses[mid]
-                tvec = np.array(list(p["position_m"].values()))
-                quat = np.array(list(p["rotation_quat"].values()))
-                Rm = R.from_quat(quat).as_matrix()
-                
-                # 마커 자세를 기준으로 오프셋을 적용하여 객체 중심 위치 계산
-                tvec_with_offset = tvec + Rm @ offset
-                offset_positions.append(tvec_with_offset)
-                all_quats.append(quat)
-                valid_ids.append(mid)
-                
-                # 시각화: 각 마커의 축 그리기
-                rvec = R.from_quat(quat).as_rotvec()
-                cv2.drawFrameAxes(undistorted_img, K, None, rvec, tvec, 0.05)
-                marker_pos_2d, _ = cv2.projectPoints(tvec.reshape(1,3), np.zeros(3), np.zeros(3), K, None)
-                cv2.putText(undistorted_img, f"ID:{mid}", tuple(marker_pos_2d.ravel().astype(int)), font, 0.6, (255, 255, 0), 2)
+                if mid in poses:
+                    p = poses[mid]
+                    tvec = np.array(list(p["position_m"].values()))
+                    quat = np.array(list(p["rotation_quat"].values()))
+                    Rm = R.from_quat(quat).as_matrix()
+                    offset_applied_positions.append(tvec + Rm @ offset)
+                    all_quaternions.append(quat)
 
-            if not offset_positions: continue
-            
-            # 여러 마커에서 계산된 객체 중심 위치/자세의 평균 계산
-            mean_pos = np.mean(offset_positions, axis=0)
-            std_pos = np.std(offset_positions, axis=0)
-            mean_quat = average_quaternion(np.array(all_quats))
-            mean_rvec = R.from_quat(mean_quat).as_rotvec()
-            
-            # 시각화: 최종 평균 자세 축 및 중심점 그리기
-            cv2.drawFrameAxes(undistorted_img, K, None, mean_rvec, mean_pos, 0.1, thickness=4)
-            mean_proj, _ = cv2.projectPoints(mean_pos.reshape(1,3), np.zeros(3), np.zeros(3), K, None)
-            xm, ym = mean_proj.ravel().astype(int)
-            cv2.drawMarker(undistorted_img, (xm, ym), (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
-            
-            # Matplotlib을 사용하여 결과 이미지 저장
-            plt.figure(figsize=(12, 9))
-            plt.imshow(cv2.cvtColor(undistorted_img, cv2.COLOR_BGR2RGB))
-            plt.title(f"Final Mean Pose ({view.upper()}-{cam})")
-            plt.axis('off')
-            plt.tight_layout()
-            
-            output_image_path = os.path.join(RESULTS_IMAGE_DIR, f"{view}_{cam}_result.png")
-            plt.savefig(output_image_path)
-            plt.close() # 메모리 해제를 위해 창 닫기
-            print(f"Saved visualization: {output_image_path}")
-            
-            # 요약 정보 추가
-            deg_rvec = np.rad2deg(mean_rvec)
-            final_summary.append({
-                "view": view, "cam": cam, 
-                "mean_x_m": mean_pos[0], "mean_y_m": mean_pos[1], "mean_z_m": mean_pos[2],
-                "std_x_m": std_pos[0], "std_y_m": std_pos[1], "std_z_m": std_pos[2],
-                "proj_x_px": xm, "proj_y_px": ym,
-                "rvec_x_deg": deg_rvec[0], "rvec_y_deg": deg_rvec[1], "rvec_z_deg": deg_rvec[2]
-            })
-            
-    return final_summary
+            if offset_applied_positions:
+                mean_offset_pos = np.mean(offset_applied_positions, axis=0)
+                std_offset_pos = np.std(offset_applied_positions, axis=0)
+                mean_quat = average_quaternion(np.array(all_quaternions))
+                mean_rvec = R.from_quat(mean_quat).as_rotvec()
+                
+                left_cam_final_pose = {'tvec': mean_offset_pos, 'rvec': mean_rvec}
 
-# =================================================================================
-# 4. 메인 실행 함수 (Main Execution)
-# =================================================================================
-def main():
-    """전체 데이터 처리 파이프라인을 실행합니다."""
-    # 결과 이미지 저장 폴더 생성
-    os.makedirs(RESULTS_IMAGE_DIR, exist_ok=True)
-    print(f"Result images will be saved to: {RESULTS_IMAGE_DIR}\n")
+                # 요약 데이터 추가
+                mean_proj, _ = cv2.projectPoints(mean_offset_pos, np.zeros(3), np.zeros(3), K, None)
+                deg_rvec = np.rad2deg(mean_rvec.flatten())
+                final_summary.append({
+                    "view": view, "cam": cam, "tvec_x": mean_offset_pos[0], "tvec_y": mean_offset_pos[1], "tvec_z": mean_offset_pos[2],
+                    "std_x": std_offset_pos[0], "std_y": std_offset_pos[1], "std_z": std_offset_pos[2],
+                    "proj_x": mean_proj.ravel().astype(int)[0], "proj_y": mean_proj.ravel().astype(int)[1],
+                    "rvec_x": deg_rvec[0], "rvec_y": deg_rvec[1], "rvec_z": deg_rvec[2]
+                })
+                print(f"  ➡️  {cam}: Pose calculated from {len(all_quaternions)} markers.")
 
-    # (필요시 실행) ZED .conf 파일로부터 .json 캘리브레이션 파일 생성
-    generate_calibration_files()
-    
-    # STAGE 1: 데이터 로드 및 이상치 제거
-    stage1_results = process_raw_data()
-    
-    # STAGE 2: Pose 재계산
-    stage2_results = recalculate_poses(stage1_results)
-    
-    # STAGE 3: 최종 요약 및 시각화
-    final_summary_data = summarize_and_visualize(stage2_results)
-    
-    # 최종 요약 파일 저장
-    if final_summary_data:
-        df = pd.DataFrame(final_summary_data)
-        df.to_json(FINAL_SUMMARY_OUTPUT_PATH, orient="records", indent=4)
-        print(f"\n--- All stages complete. Final summary saved to: {FINAL_SUMMARY_OUTPUT_PATH} ---")
-        print("Final Summary DataFrame:")
-        print(df)
+                # ▼▼▼ [수정] LEFTCAM 시각화 함수 호출 위치 ▼▼▼
+                save_visualization_image(
+                    view=view, cam=cam, image_path=img_files[0], K=K, dist=dist,
+                    poses=poses, marker_offsets=marker_offsets, final_pose=left_cam_final_pose,
+                    output_dir=RESULTS_IMAGE_DIR
+                )
     else:
-        print("\n--- Processing finished, but no data was generated for the final summary. ---")
+        print(f"  ❌ [LEFTCAM] Skipped: No marker data found in Stage 2 results.")
+        
+    RIGHT_CAM_CORRECTION_OFFSET = np.array([-0.025, 0, 0]) 
+    
+    # --- 2. RIGHTCAM 처리 ---
+    cam = 'rightcam'
+    if left_cam_final_pose:
+        serial = camera_serials.get(view)
+        stereo_params = load_stereo_config(serial)
+        
+        if stereo_params:
+            # --- 변수 이름 변경으로 가독성 향상 ---
+            
+            # 1. leftcam이 바라본 마커의 자세 (Marker -> LeftCam)
+            rvec_marker_in_left, tvec_marker_in_left = left_cam_final_pose['rvec'], left_cam_final_pose['tvec']
+            R_marker_in_left, _ = cv2.Rodrigues(rvec_marker_in_left)
+            T_marker_to_left = np.eye(4)
+            T_marker_to_left[:3, :3], T_marker_to_left[:3, 3] = R_marker_in_left, tvec_marker_in_left
 
-if __name__ == "__main__":
-    main()
+            # 2. ZED 설정: leftcam 기준 rightcam의 위치 (RightCam -> LeftCam)
+            t_right_in_left = np.array([p/1000.0 for p in [stereo_params['baseline'], stereo_params['ty'], stereo_params['tz']]])
+            R_right_in_left = R.from_euler('zyx', [stereo_params['rz'], stereo_params['ry'], stereo_params['rx']]).as_matrix()
+            T_right_to_left = np.eye(4)
+            T_right_to_left[:3, :3], T_right_to_left[:3, 3] = R_right_in_left, t_right_in_left
+            
+            # 3. 역변환: rightcam 기준 leftcam의 위치 (LeftCam -> RightCam)
+            T_left_to_right = np.linalg.inv(T_right_to_left)
+
+            # 4. 최종 계산: rightcam이 바라본 마커의 자세 (Marker -> RightCam)
+            T_marker_to_right = T_left_to_right @ T_marker_to_left
+            
+            # 최종 결과 추출
+            R_marker_in_right, tvec_right = T_marker_to_right[:3, :3], T_marker_to_right[:3, 3]
+            rvec_right, _ = cv2.Rodrigues(R_marker_in_right)
+            
+            print(f"   - Applying manual correction offset to rightcam: {RIGHT_CAM_CORRECTION_OFFSET.flatten()} m")
+            tvec_right += RIGHT_CAM_CORRECTION_OFFSET
+            
+            # 요약 데이터 추가
+            deg_rvec_right = np.rad2deg(rvec_right.flatten())
+            # (나머지 요약 데이터 추가 로직은 기존과 동일)
+            final_summary.append({
+                "view": view, "cam": cam, "tvec_x": tvec_right[0], "tvec_y": tvec_right[1], "tvec_z": tvec_right[2],
+                "std_x": 0, "std_y": 0, "std_z": 0, "proj_x": -1, "proj_y": -1,
+                "rvec_x": deg_rvec_right[0], "rvec_y": deg_rvec_right[1], "rvec_z": deg_rvec_right[2]
+            })
+            print(f"  ➡️  {cam}: Pose calculated from stereo transformation.")
+
+            # ▼▼▼ [수정] RIGHTCAM 시각화 함수 호출 위치 ▼▼▼
+            calib_path_right = os.path.join(CALIB_DIR, f"{view}_{serial}_{cam}_calib.json")
+            img_files_right = glob.glob(os.path.join(IMAGE_DIR, f"{view}_*_{cam}_*.png"))
+
+            if os.path.exists(calib_path_right) and img_files_right:
+                with open(calib_path_right) as f: calib = json.load(f)
+                K_right, dist_right = np.array(calib["camera_matrix"]), np.array(calib["distortion_coeffs"])
+                
+                right_cam_final_pose = {'tvec': tvec_right, 'rvec': rvec_right}
+                # RightCam은 변환된 최종 포즈만 시각화 (개별 마커는 LeftCam 기준이므로 그리지 않음)
+                save_visualization_image(
+                    view=view, cam=cam, image_path=img_files_right[0], K=K_right, dist=dist_right,
+                    poses=recalculated_data_stage2.get(view, {}).get(cam, {}), # RightCam에서 감지된 마커도 함께 표시
+                    marker_offsets=marker_offsets, final_pose=right_cam_final_pose,
+                    output_dir=RESULTS_IMAGE_DIR
+                )
+    else:
+        print(f"  ❌ [RIGHTCAM] Skipped: No valid pose from leftcam to transform.")
+# --- 최종 요약 파일 저장 ---
+if final_summary:
+    df = pd.DataFrame(final_summary)
+    df.to_json(FINAL_SUMMARY_OUTPUT_PATH, orient="records", indent=4)
+    print(f"\n--- ✅ All stages complete. Final summary saved to: {FINAL_SUMMARY_OUTPUT_PATH} ---")
+    print(df)
+else:
+    print("\n--- ❌ Processing finished, but no data was generated for the final summary. ---")
