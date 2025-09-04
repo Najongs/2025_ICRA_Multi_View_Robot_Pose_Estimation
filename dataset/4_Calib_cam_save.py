@@ -12,7 +12,7 @@ camera_list = {
 
 
 zed_conf_dir = "./All_camera_conf"
-output_dir = "./Meca_insertion/Meca_calib_cam_from_conf"
+output_dir = "./Meca500/Meca_calib_cam_from_conf"
 os.makedirs(output_dir, exist_ok=True)
 def load_fhd_calibration(conf_path, side):
     config = configparser.ConfigParser()
