@@ -34,21 +34,6 @@ HEATMAP_SIZE = (128, 128)
 MODEL_NAME = 'facebook/dinov3-vitb16-pretrain-lvd1689m'
 MAX_VIEWS_PER_GROUP = 8
 
-# --- 🖥️ 2. GPU 설정 확인 ---
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2"
-if torch.cuda.is_available():
-    print(f"✅ 사용 가능한 GPU: {torch.cuda.device_count()}개")
-else:
-    print("⚠️ GPU를 사용할 수 없습니다. CPU로 실행됩니다.")
-
-# --- 📄 3. CSV 로드 ---
-TOTAL_CSV_PATH = '../dataset/franka_research3/fr3_matched_joint_angle.csv'
-print(f"\nLoading data from {TOTAL_CSV_PATH}...")
-total_csv = pd.read_csv(TOTAL_CSV_PATH)
-total_csv.sort_values('robot_timestamp', inplace=True, ignore_index=True)
-print("✅ CSV file loaded and sorted successfully.")
-
 # ▼▼▼ [핵심 수정] 그룹핑 로직을 함수로 분리 ▼▼▼
 def perform_grouping(df, tolerance, max_views):
     """주어진 tolerance 값으로 데이터프레임을 그룹핑합니다."""
@@ -72,59 +57,6 @@ def perform_grouping(df, tolerance, max_views):
             image_paths = [{'image_path': view['image_path']} for view in current_views]
             groups.append({'views': image_paths, 'joint_angles': joint_angles})
     return groups
-
-# --- 4. TIME_TOLERANCE 값 그리드 서치 ---
-tolerance_candidates = np.round(np.arange(0.05, 0.101, 0.01), 2)
-best_tolerance_recommendation = 0
-max_full_groups = 0
-
-print(f"\nStarting Grid Search for TIME_TOLERANCE in range: {list(tolerance_candidates)}")
-for tolerance in tolerance_candidates:
-    # 함수를 호출하여 그룹핑 실행
-    temp_groups = perform_grouping(total_csv, tolerance, MAX_VIEWS_PER_GROUP)
-    
-    # 결과 분석 및 출력
-    view_counts = [len(g['views']) for g in temp_groups]
-    distribution = pd.Series(view_counts).value_counts().sort_index(ascending=False)
-    
-    print("-" * 50)
-    print(f"Testing Tolerance: {tolerance:.2f} seconds...")
-    print(f"  -> Total groups created: {len(temp_groups)}")
-    print("  -> View count distribution:")
-    print(distribution.to_string())
-
-    current_full_groups = distribution.get(8, 0)
-    if current_full_groups > max_full_groups:
-        max_full_groups = current_full_groups
-        best_tolerance_recommendation = tolerance
-
-print("-" * 50)
-print(f"\n🏆 Grid Search Recommendation: TIME_TOLERANCE = {best_tolerance_recommendation} (produced {max_full_groups} full groups)")
-
-# ▼▼▼ [핵심 수정] 사용자로부터 최종 값 입력받기 ▼▼▼
-final_tolerance = 0.07
-print(f"\nFinal TIME_TOLERANCE set to: {final_tolerance}")
-dataset_groups = perform_grouping(total_csv, final_tolerance, MAX_VIEWS_PER_GROUP)
-print(f"Total {len(dataset_groups)} groups created before filtering.")
-
-
-# ▼▼▼ [핵심 수정] 필터링을 먼저 수행합니다. ▼▼▼
-groups_before_filtering = len(dataset_groups)
-dataset_groups = [group for group in dataset_groups if len(group['views']) > 1]
-print(f"ℹ️ Removed {groups_before_filtering - len(dataset_groups)} groups with only 1 view.")
-
-
-# --- 최종 결과 요약 (필터링 이후) ---
-# 필터링이 끝난 최종 dataset_groups를 기준으로 모든 통계를 계산합니다.
-print(f"\n✅ Final Total Groups: {len(dataset_groups)}")
-
-total_images_in_groups = sum(len(g['views']) for g in dataset_groups)
-print(f"✅ Final Total Images to be used: {total_images_in_groups}")
-
-if dataset_groups:
-    view_counts = [len(g['views']) for g in dataset_groups]
-    print(f"\n--- Final View count distribution ---")
-    print(pd.Series(view_counts).value_counts().sort_index(ascending=False))
 
 # ==============================================================================
 # 헬퍼 함수 (Ground Truth 생성용)
@@ -308,24 +240,7 @@ import pandas as pd
 # 1. 시각화를 위한 Transform 및 데이터셋 준비 (기존과 동일)
 # ==============================================================================
 
-print("Loading DINOv3 Processor for transformation config...")
-processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-dino_mean = processor.image_mean
-dino_std = processor.image_std
 
-try:
-    crop_size = processor.crop_size['height']
-    resize_size = processor.size['shortest_edge']
-except (TypeError, KeyError):
-    print(f"Resized the image to 224x224")
-    resize_size = crop_size = 224
-
-vis_transform = transforms.Compose([
-    transforms.Resize(resize_size),
-    transforms.CenterCrop(crop_size),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=dino_mean, std=dino_std)
-])
 
 # ==============================================================================
 # 2. 시각화 함수 정의 (수정)
@@ -407,10 +322,6 @@ def visualize_samples_by_group_size(groups, transform, mean, std):
 # 3. 시각화 실행
 # ==============================================================================
 # 최종적으로 필터링된 dataset_groups를 사용하여 시각화 함수 호출
-visualize_samples_by_group_size(dataset_groups, 
-                                transform=vis_transform, 
-                                mean=dino_mean, 
-                                std=dino_std)
 
 class DINOv3Backbone(nn.Module):
     """
@@ -719,7 +630,8 @@ class DINOv3PoseEstimator(nn.Module):
 # Cell 5: 학습/검증용 시각화 함수
 # ==============================================================================
 
-def visualize_dataset_sample(dataset, mean, std, num_samples=1):
+def visualize_dataset_sample(dataset, mean, std, results_dir, num_samples=1):
+    os.makedirs(results_dir, exist_ok=True)
     """데이터셋의 GT 샘플을 시각화하여 데이터 파이프라인을 검증합니다."""
     print("\n--- Visualizing Dataset Samples ---")
     # (이전 Cell 3에서 사용했던 visualize_final_groups 함수와 거의 동일한 로직)
@@ -757,9 +669,10 @@ def visualize_dataset_sample(dataset, mean, std, num_samples=1):
         print(f"  -> Saved GT sample visualization to {os.path.join(results_dir, filename)}")
         plt.close() # 메모리 해제
 
-def visualize_predictions(model, dataset, device, mean, std, epoch_num, num_samples=1):
+def visualize_predictions(model, dataset, device, mean, std, epoch_num, results_dir, num_samples=1):
     """검증 데이터셋 샘플에 대한 모델의 예측 결과를 GT와 함께 시각화합니다."""
     print(f"\n--- Visualizing Predictions for Epoch {epoch_num} ---")
+    os.makedirs(results_dir, exist_ok=True)
     model.eval()
     figures = []
     
@@ -868,46 +781,86 @@ from tqdm import tqdm
 # ==============================================================================
 
 def train_one_epoch(model, loader, optimizers, criteria, device, loss_weight_kpt, epoch_num):
-    model.train() # 모델을 학습 모드로 설정
+    model.train()
     total_loss_kpt, total_loss_ang = 0.0, 0.0
     optimizer_kpt, optimizer_ang = optimizers['kpt'], optimizers['ang']
     crit_kpt, crit_ang = criteria['kpt'], criteria['ang']
-    
+
     loop = tqdm(loader, desc=f"Epoch {epoch_num} [Train]")
     for batch in loop:
         image_dict, gt_heatmaps_dict, gt_angles = batch
-        if image_dict is None: continue
 
-        # --- 1. 데이터 GPU로 이동 ---
-        images_gpu = {k: v.to(device) for k, v in image_dict.items()}
+        # ---- (A) 랭크 간 '유효 배치' 여부 동기화 ----
+        has_data_local = int(image_dict is not None)
+        has_data_all = torch.tensor(has_data_local, device=device)
+        import torch.distributed as dist
+        dist.all_reduce(has_data_all, op=dist.ReduceOp.SUM)
+        has_any_rank_data = int(has_data_all.item())
+
+        if not has_any_rank_data:
+            # 모든 랭크가 빈 배치이면 전체 스킵
+            continue
+
+        if image_dict is None:
+            # 이 랭크만 빈 배치인 경우: 더미 0-loss backward로 통신 타이밍 맞춤
+            optimizer_kpt.zero_grad(set_to_none=True)
+            optimizer_ang.zero_grad(set_to_none=True)
+            # 모든 파라미터에 대해 '정의된(=0) grad'를 만들기 위해 합계를 0배 함
+            dummy = None
+            for p in model.parameters():
+                if p.requires_grad:
+                    dummy = (p.sum() if dummy is None else dummy + p.sum())
+            if dummy is None:
+                # 이론상 발생X: 학습 파라미터가 하나도 없는 경우
+                dummy = torch.zeros((), device=device, requires_grad=True)
+            (dummy * 0.0).backward()
+            optimizer_kpt.step()
+            optimizer_ang.step()
+            loop.set_postfix(loss_kpt='skip', loss_ang='skip')
+            continue
+
+        # ---- (B) 정상 경로: 단일 backward ----
+        images_gpu   = {k: v.to(device) for k, v in image_dict.items()}
         heatmaps_gpu = {k: v.to(device) for k, v in gt_heatmaps_dict.items()}
-        angles_gpu = gt_angles.to(device)
-        
-        # --- 2. 모델 예측 (Forward Pass) ---
+        angles_gpu   = gt_angles.to(device)
+
         pred_heatmaps_dict, pred_angles = model(images_gpu)
-        
-        # --- 3. 손실 계산 ---
+
         loss_ang = crit_ang(pred_angles, angles_gpu)
-        
-        # 'dummy' 키를 제외한 실제 뷰에 대해서만 손실을 계산
-        real_view_keys = [k for k in pred_heatmaps_dict if not k.startswith('dummy')]
-        if not real_view_keys: continue 
+
+        real_view_keys = list(pred_heatmaps_dict.keys())
+        if not real_view_keys:
+            # 극히 드물게 키 없음 → 더미 backward로 정렬
+            optimizer_kpt.zero_grad(set_to_none=True)
+            optimizer_ang.zero_grad(set_to_none=True)
+            dummy = None
+            for p in model.parameters():
+                if p.requires_grad:
+                    dummy = (p.sum() if dummy is None else dummy + p.sum())
+            (dummy * 0.0).backward()
+            optimizer_kpt.step()
+            optimizer_ang.step()
+            loop.set_postfix(loss_kpt='skip2', loss_ang='skip2')
+            continue
 
         loss_kpt_views = [crit_kpt(pred_heatmaps_dict[k], heatmaps_gpu[k]) for k in real_view_keys]
-        loss_kpt = (torch.stack(loss_kpt_views).mean()) * loss_weight_kpt
-        
-        # --- 4. 역전파 및 파라미터 업데이트 ---
-        optimizer_kpt.zero_grad(); optimizer_ang.zero_grad()
-        loss_kpt.backward(retain_graph=True) # 공유 파라미터를 위해 그래프 유지
-        loss_ang.backward()
-        optimizer_kpt.step(); optimizer_ang.step()
-        
-        # --- 5. 로깅 ---
+        loss_kpt = torch.stack(loss_kpt_views).mean() * loss_weight_kpt
+
+        total_loss = loss_kpt + loss_ang
+
+        optimizer_kpt.zero_grad(set_to_none=True)
+        optimizer_ang.zero_grad(set_to_none=True)
+        total_loss.backward()   # ← 한 번만!
+        optimizer_kpt.step()
+        optimizer_ang.step()
+
         total_loss_kpt += loss_kpt.item()
         total_loss_ang += loss_ang.item()
         loop.set_postfix(loss_kpt=loss_kpt.item(), loss_ang=loss_ang.item())
 
     return total_loss_kpt / len(loader), total_loss_ang / len(loader)
+
+
 
 def validate(model, loader, criteria, device, loss_weight_kpt, epoch_num):
     model.eval() # 모델을 평가 모드로 설정
@@ -946,19 +899,34 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from transformers import AutoImageProcessor
 
-def setup(hyperparameters, dataset_groups):
-    print("--- Setting up the training environment ---")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# ▼▼▼ DDP 필수 라이브러리 ▼▼▼
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
+# ==============================================================================
+# Setup / Teardown 함수
+# ==============================================================================
+def setup_ddp():
+    dist.init_process_group(backend="nccl")
+    rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(rank)
+    return rank
+
+def cleanup_ddp():
+    dist.destroy_process_group()
+
+def setup(hyperparameters, dataset_groups, rank, world_size):
+    print(f"--- [Rank {rank}] Setting up environment ---")
+    device = torch.device(f'cuda:{rank}')
     
-    # --- Transforms (512x512) ---
     processor = AutoImageProcessor.from_pretrained(hyperparameters['model_name'])
     mean, std = processor.image_mean, processor.image_std
     resize_size, crop_size = 512, 512
-    print(f"Image size set to: {resize_size}x{crop_size}")
-
+    
     train_transform = transforms.Compose([
         transforms.Resize(resize_size), transforms.CenterCrop(crop_size),
-        transforms.ColorJitter(brightness=0.3, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
         transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)
     ])
     val_transform = transforms.Compose([
@@ -966,7 +934,6 @@ def setup(hyperparameters, dataset_groups):
         transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)
     ])
     
-    # --- Datasets & DataLoaders ---
     torch.manual_seed(42)
     indices = torch.randperm(len(dataset_groups)).tolist()
     train_size = int(len(dataset_groups) * (1 - hyperparameters['val_split']))
@@ -976,150 +943,258 @@ def setup(hyperparameters, dataset_groups):
     train_dataset = RobotPoseDataset(groups=train_groups, transform=train_transform)
     val_dataset = RobotPoseDataset(groups=val_groups, transform=val_transform)
     
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    
     def collate_fn(batch):
         batch = [b for b in batch if b[0] is not None]
         if not batch: return None, None, None
-        
         image_dicts, heatmap_dicts, angles_list = zip(*batch)
         all_keys = set().union(*[d.keys() for d in image_dicts])
-        
         sample_img = list(image_dicts[0].values())[0]
         dummy_img = torch.zeros_like(sample_img)
         sample_hmap = list(heatmap_dicts[0].values())[0]
         dummy_hmap = torch.zeros_like(sample_hmap)
-
         standardized_images, standardized_heatmaps = [], []
         for i in range(len(batch)):
             new_img_dict = {key: image_dicts[i].get(key, dummy_img) for key in all_keys}
             new_hmap_dict = {key: heatmap_dicts[i].get(key, dummy_hmap) for key in all_keys}
             standardized_images.append(new_img_dict)
             standardized_heatmaps.append(new_hmap_dict)
-            
         images = torch.utils.data.dataloader.default_collate(standardized_images)
         heatmaps = torch.utils.data.dataloader.default_collate(standardized_heatmaps)
         angles = torch.stack(angles_list)
         return images, heatmaps, angles
 
-    train_loader = DataLoader(train_dataset, batch_size=hyperparameters['batch_size'], shuffle=True, num_workers=16, collate_fn=collate_fn, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=hyperparameters['batch_size'], shuffle=False, num_workers=16, collate_fn=collate_fn, pin_memory=True)
-    print(f"Dataset split: {len(train_dataset)} train, {len(val_dataset)} val.")
-
-    # --- Model, Criteria, Optimizers, Schedulers ---
-    model = DINOv3PoseEstimator(hyperparameters['model_name'])
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs!")
-        model = nn.DataParallel(model)
-    model.to(device)
+    train_loader = DataLoader(train_dataset, batch_size=hyperparameters['batch_size'], num_workers=8, collate_fn=collate_fn, pin_memory=True, sampler=train_sampler)
+    val_loader = DataLoader(val_dataset, batch_size=hyperparameters['batch_size'], num_workers=8, collate_fn=collate_fn, pin_memory=True, sampler=val_sampler)
+    
+    model = DINOv3PoseEstimator(hyperparameters['model_name']).to(device)
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     
     criteria = {'kpt': nn.MSELoss(), 'ang': nn.SmoothL1Loss(beta=1.0)}
     
-    m = model.module if isinstance(model, nn.DataParallel) else model
-    params_kpt = list(m.cnn_stem.parameters()) + list(m.view_embeddings.parameters()) + \
-                 list(m.fusion_module.parameters()) + list(m.keypoint_enricher.parameters()) + \
-                 list(m.keypoint_head.parameters())
+    m = model.module
+    params_kpt = list(m.cnn_stem.parameters()) + list(m.view_embeddings.parameters()) + list(m.fusion_module.parameters()) + list(m.keypoint_enricher.parameters()) + list(m.keypoint_head.parameters())
     params_ang = list(m.angle_head.parameters())
     
-    optimizers = {
-        'kpt': optim.AdamW(params_kpt, lr=hyperparameters['lr_kpt']),
-        'ang': optim.AdamW(params_ang, lr=hyperparameters['lr_ang'])
-    }
-    schedulers = {
-        'kpt': CosineAnnealingLR(optimizers['kpt'], T_max=hyperparameters['num_epochs']),
-        'ang': CosineAnnealingLR(optimizers['ang'], T_max=hyperparameters['num_epochs'])
-    }
+    optimizers = { 'kpt': optim.AdamW(params_kpt, lr=hyperparameters['lr_kpt']), 'ang': optim.AdamW(params_ang, lr=hyperparameters['lr_ang']) }
+    schedulers = { 'kpt': CosineAnnealingLR(optimizers['kpt'], T_max=hyperparameters['num_epochs']), 'ang': CosineAnnealingLR(optimizers['ang'], T_max=hyperparameters['num_epochs']) }
     
-    print("✅ Setup complete.")
-    return model, train_loader, val_loader, criteria, optimizers, schedulers, device, mean, std
+    if rank == 0: print(f"Dataset split: {len(train_dataset)} train, {len(val_dataset)} val.")
+    return model, train_loader, val_loader, criteria, optimizers, schedulers, device, mean, std, train_sampler
 
 # ==============================================================================
 # Cell 8: 메인 실행부
 # ==============================================================================
 import time
-def main():
-    # --- 1. 설정 초기화 ---
-    hyperparameters = {
-        'model_name': MODEL_NAME,
-        'batch_size': 8,  # GPU 메모리 사용량을 보며 조절 (64도 클 수 있음)
-        'num_epochs': 100,
-        'val_split': 0.1,
-        'loss_weight_kpt': 100.0,
-        'lr_kpt': 1e-4,
-        'lr_ang': 1e-4,
-    }
-    RESULTS_DIR = "results"
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    CHECKPOINT_PATH = 'multiview_checkpoint.pth'
-    BEST_MODEL_PATH = 'best_multiview_model.pth' 
 
-    # --- 2. WandB 초기화 ---
-    run = wandb.init(
-        project="multiview-robot-pose-final",
-        config=hyperparameters,
-        name=f"run_{time.strftime('%Y%m%d_%H%M%S')}"
+def main():
+    rank = setup_ddp()
+    world_size = dist.get_world_size()
+
+    # --- 🖥️ GPU 설정 확인 (내부에서 CUDA_VISIBLE_DEVICES 설정 X) ---
+    os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+    if torch.cuda.is_available():
+        if rank == 0:
+            print(f"✅ 사용 가능한 GPU: {torch.cuda.device_count()}개")
+    else:
+        if rank == 0:
+            print("⚠️ GPU를 사용할 수 없습니다. CPU로 실행됩니다.")
+
+    # --- 📄 CSV 로드 (rank==0에서만 디스크 I/O) ---
+    TOTAL_CSV_PATH = '../dataset/franka_research3/fr3_matched_joint_angle.csv'
+    if rank == 0:
+        print(f"\nLoading data from {TOTAL_CSV_PATH}...")
+        total_csv = pd.read_csv(TOTAL_CSV_PATH)
+        total_csv.sort_values('robot_timestamp', inplace=True, ignore_index=True)
+        print("✅ CSV file loaded and sorted successfully.")
+    else:
+        total_csv = None  # placeholder
+
+    # --- 모든 랭크에 CSV 브로드캐스트 ---
+    obj_list = [total_csv]
+    dist.broadcast_object_list(obj_list, src=0)
+    total_csv = obj_list[0]
+
+    # --- TIME_TOLERANCE 그리드 서치 (출력은 rank==0만) ---
+    tolerance_candidates = np.round(np.arange(0.05, 0.101, 0.01), 2)
+    best_tolerance_recommendation = 0
+    max_full_groups = 0
+
+    if rank == 0:
+        print(f"\nStarting Grid Search for TIME_TOLERANCE in range: {list(tolerance_candidates)}")
+    for tolerance in tolerance_candidates:
+        temp_groups = perform_grouping(total_csv, tolerance, MAX_VIEWS_PER_GROUP)
+        view_counts = [len(g['views']) for g in temp_groups]
+        distribution = pd.Series(view_counts).value_counts().sort_index(ascending=False)
+
+        if rank == 0:
+            print("-" * 50)
+            print(f"Testing Tolerance: {tolerance:.2f} seconds...")
+            print(f"  -> Total groups created: {len(temp_groups)}")
+            print("  -> View count distribution:")
+            print(distribution.to_string())
+
+        current_full_groups = distribution.get(8, 0)
+        if current_full_groups > max_full_groups:
+            max_full_groups = current_full_groups
+            best_tolerance_recommendation = tolerance
+
+    if rank == 0:
+        print("-" * 50)
+        print(f"\n🏆 Grid Search Recommendation: TIME_TOLERANCE = {best_tolerance_recommendation} (produced {max_full_groups} full groups)")
+
+    # --- 최종 tolerance 적용 및 그룹 생성 ---
+    final_tolerance = 0.07
+    if rank == 0:
+        print(f"\nFinal TIME_TOLERANCE set to: {final_tolerance}")
+    dataset_groups = perform_grouping(total_csv, final_tolerance, MAX_VIEWS_PER_GROUP)
+    if rank == 0:
+        print(f"Total {len(dataset_groups)} groups created before filtering.")
+
+    # --- 1뷰 그룹 제거 ---
+    groups_before_filtering = len(dataset_groups)
+    dataset_groups = [group for group in dataset_groups if len(group['views']) > 1]
+    if rank == 0:
+        print(f"ℹ️ Removed {groups_before_filtering - len(dataset_groups)} groups with only 1 view.")
+        print(f"\n✅ Final Total Groups: {len(dataset_groups)}")
+        total_images_in_groups = sum(len(g['views']) for g in dataset_groups)
+        print(f"✅ Final Total Images to be used: {total_images_in_groups}")
+        if dataset_groups:
+            view_counts = [len(g['views']) for g in dataset_groups]
+            print(f"\n--- Final View count distribution ---")
+            print(pd.Series(view_counts).value_counts().sort_index(ascending=False))
+
+    # --- 하이퍼파라미터 & 경로 ---
+    hyperparameters = {
+        'model_name': MODEL_NAME, 'batch_size': 18, 'num_epochs': 100, 'val_split': 0.1,
+        'loss_weight_kpt': 100.0, 'lr_kpt': 1e-4, 'lr_ang': 1e-4,
+    }
+    RESULTS_DIR = "results_ddp"
+    CHECKPOINT_PATH = 'multiview_checkpoint_ddp.pth'
+    BEST_MODEL_PATH = 'best_multiview_model_ddp.pth'
+
+    if rank == 0:
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        print("--- Data Preparation ---")
+
+    # --- dataset_groups 객체 브로드캐스트 (파일 대신 broadcast_object_list 사용) ---
+    obj_list = [dataset_groups]
+    dist.broadcast_object_list(obj_list, src=0)
+    dataset_groups = obj_list[0]
+
+    # --- DINOv3 Processor 로드 (모든 랭크 동일) ---
+    if rank == 0:
+        print("Loading DINOv3 Processor for transformation config...")
+    processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
+    dino_mean = processor.image_mean
+    dino_std = processor.image_std
+    try:
+        crop_size = processor.crop_size['height']
+        resize_size = processor.size['shortest_edge']
+    except (TypeError, KeyError):
+        if rank == 0:
+            print(f"Resized the image to 224x224")
+        resize_size = crop_size = 224
+
+    vis_transform = transforms.Compose([
+        transforms.Resize(resize_size),
+        transforms.CenterCrop(crop_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=dino_mean, std=dino_std)
+    ])
+
+    # --- 시각화는 rank==0에서만 (plt.show 사용하지 말고 저장만) ---
+    if rank == 0:
+        visualize_samples_by_group_size(dataset_groups, transform=vis_transform, mean=dino_mean, std=dino_std)
+
+    dist.barrier()  # 모든 프로세스 동기화
+
+    # --- 학습 세팅 ---
+    model, train_loader, val_loader, criteria, optimizers, schedulers, device, mean, std, train_sampler = setup(
+        hyperparameters, dataset_groups, rank, world_size
     )
 
-    # --- 3. 학습 환경 구성 ---
-    model, train_loader, val_loader, criteria, optimizers, schedulers, device, mean, std = setup(hyperparameters, dataset_groups)
+    # visualize_* 함수 내부에서 사용할 전역 결과 경로 주입 (해당 함수가 results_dir를 전역 참조할 때 대비)
+    global results_dir
+    results_dir = RESULTS_DIR
 
-    wandb.watch(model, log="all", log_freq=100)
+    # --- wandb (rank==0 한정) ---
+    if rank == 0:
+        run = wandb.init(project="multiview-ddp-final", config=hyperparameters,
+                         name=f"run_ddp_{time.strftime('%Y%m%d_%H%M%S')}")
+        wandb.watch(model, log="all", log_freq=100)
+    else:
+        run = None
+
     start_epoch, best_val_loss = 0, float('inf')
 
-    # --- 4. 체크포인트 또는 사전 학습 모델 로드 ---
+    # --- 체크포인트 로드 ---
     if os.path.exists(CHECKPOINT_PATH):
-        print(f"✅ Resuming training from checkpoint: '{CHECKPOINT_PATH}'")
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
-        model_to_load = model.module if isinstance(model, nn.DataParallel) else model
-        model_to_load.load_state_dict(checkpoint['model_state_dict'])
-        optimizers['kpt'].load_state_dict(checkpoint['optimizer_kpt_state_dict'])
-        optimizers['ang'].load_state_dict(checkpoint['optimizer_ang_state_dict'])
-        schedulers['kpt'].load_state_dict(checkpoint['scheduler_kpt_state_dict'])
-        schedulers['ang'].load_state_dict(checkpoint['scheduler_ang_state_dict'])
-        start_epoch = checkpoint['epoch']
-        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        print(f"   -> Resumed from epoch {start_epoch + 1}.")
-    elif os.path.exists(BEST_MODEL_PATH):
-        print(f"ℹ️ No checkpoint. Fine-tuning from best model: '{BEST_MODEL_PATH}'")
-        state_dict = torch.load(BEST_MODEL_PATH, map_location=device)
-        model.module.load_state_dict(state_dict) if isinstance(model, nn.DataParallel) else model.load_state_dict(state_dict)
-    else:
-        print("ℹ️ Starting training from scratch.")
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=lambda storage, loc: storage.cuda(rank))
+        model.module.load_state_dict(checkpoint['model_state_dict'])
+        # (옵티마이저/스케줄러 상태 복원 필요 시 여기에 추가)
+        if rank == 0:
+            print(f"✅ Resuming training from checkpoint.")
 
-    # --- 5. 학습 루프 시작 ---
-    print("\n--- Starting Training ---")
+    # --- 학습 루프 ---
+    if rank == 0:
+        print("\n--- Starting Training ---")
     for epoch in range(start_epoch, hyperparameters['num_epochs']):
-        train_loss_kpt, train_loss_ang = train_one_epoch(model, train_loader, optimizers, criteria, device, hyperparameters['loss_weight_kpt'], epoch + 1)
-        val_loss = validate(model, val_loader, criteria, device, hyperparameters['loss_weight_kpt'], epoch + 1)
-        
-        schedulers['kpt'].step()
-        schedulers['ang'].step()
-        
-        # --- 6. 로깅 및 모델 저장 ---
-        current_lr_kpt = optimizers['kpt'].param_groups[0]['lr']
-        wandb.log({"epoch": epoch + 1, "train_loss_kpt": train_loss_kpt, "train_loss_ang": train_loss_ang, "avg_val_loss": val_loss, "lr_kpt": current_lr_kpt})
-        print(f"Epoch {epoch+1} -> Val Loss: {val_loss:.6f} | LR_kpt: {current_lr_kpt:.6f}")
-        
-        state_to_save = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            print(f"🎉 New best model saved with validation loss: {best_val_loss:.6f}")
-            torch.save(state_to_save, BEST_MODEL_PATH)
-            
-            figs = visualize_predictions(model, val_loader.dataset, device, mean, std, epoch + 1, RESULTS_DIR, 1)
-            wandb.log({"validation_predictions": [wandb.Image(fig) for fig in figs]})
-            for fig in figs: plt.close(fig)
+        train_sampler.set_epoch(epoch)
 
-        checkpoint = {
-            'epoch': epoch + 1, 'model_state_dict': state_to_save,
-            'optimizer_kpt_state_dict': optimizers['kpt'].state_dict(),
-            'optimizer_ang_state_dict': optimizers['ang'].state_dict(),
-            'scheduler_kpt_state_dict': schedulers['kpt'].state_dict(),
-            'scheduler_ang_state_dict': schedulers['ang'].state_dict(),
-            'best_val_loss': best_val_loss,
-        }
-        torch.save(checkpoint, CHECKPOINT_PATH)
+        train_loss_kpt, train_loss_ang = train_one_epoch(
+            model, train_loader, optimizers, criteria, device, hyperparameters['loss_weight_kpt'], epoch + 1
+        )
+        val_loss = validate(
+            model, val_loader, criteria, device, hyperparameters['loss_weight_kpt'], epoch + 1
+        )
+        schedulers['kpt'].step(); schedulers['ang'].step()
 
-    print("\n--- Training Finished ---")
-    run.finish()
-    
+        if rank == 0:
+            current_lr_kpt = optimizers['kpt'].param_groups[0]['lr']
+            wandb.log({
+                "epoch": epoch + 1,
+                "train_loss_kpt": train_loss_kpt,
+                "train_loss_ang": train_loss_ang,
+                "avg_val_loss": val_loss,
+                "lr_kpt": current_lr_kpt
+            })
+            print(f"Epoch {epoch+1} -> Val Loss: {val_loss:.6f} | LR_kpt: {current_lr_kpt:.6f}")
+
+            # DataParallel 분기 불필요 (DDP 사용 중)지만 안전하게 유지
+            state_to_save = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                print(f"🎉 New best model saved with validation loss: {best_val_loss:.6f}")
+                torch.save(state_to_save, BEST_MODEL_PATH)
+
+                # 주의: visualize_predictions 시그니처가 (model, dataset, device, mean, std, epoch_num, num_samples=1) 인 경우
+                # 아래 호출에서 RESULTS_DIR 인자를 제거하세요. (현재 코드엔 RESULTS_DIR를 전역 results_dir로 주입)
+                figs = visualize_predictions(model, val_loader.dataset, device, mean, std, epoch + 1, RESULTS_DIR, 1)
+                wandb.log({"validation_predictions": [wandb.Image(fig) for fig in figs]})
+                for fig in figs:
+                    plt.close(fig)
+
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': state_to_save,
+                'optimizer_kpt_state_dict': optimizers['kpt'].state_dict(),
+                'optimizer_ang_state_dict': optimizers['ang'].state_dict(),
+                'scheduler_kpt_state_dict': schedulers['kpt'].state_dict(),
+                'scheduler_ang_state_dict': schedulers['ang'].state_dict(),
+                'best_val_loss': best_val_loss,
+            }
+            torch.save(checkpoint, CHECKPOINT_PATH)
+
+    cleanup_ddp()
+
+    if rank == 0:
+        print("\n--- Training Finished ---")
+        if run is not None:
+            run.finish()
+
 if __name__ == '__main__':
     main()
