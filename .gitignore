@@ -7,8 +7,8 @@ __pycache__/
 *.json
 *.yaml
 *.webm
-
-
+*.tar.gz
+*.gz
 *.pt
 *.pth
 

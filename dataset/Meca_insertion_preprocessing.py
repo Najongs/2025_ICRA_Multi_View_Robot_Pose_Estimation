@@ -24,7 +24,7 @@ MARKER_REAL_SIZE_M = 0.05
 CALIB_DIR = "./Meca_insertion/Meca_calib_cam_from_conf"
 STEREO_CONF_DIR = "./All_camera_conf"
 IMAGE_DIR = "./Meca_insertion/Meca_ArUco/ArUco_cap1_250514"
-FINAL_SUMMARY_OUTPUT_PATH = "./Meca_insertion/Meca_insertion_aruco_final_summary.json"
+FINAL_SUMMARY_OUTPUT_PATH = "./Meca_insertion/Meca_insertion_aruco_pose_summary.json"
 
 camera_serials = {"front":41182735, "right":49429257, "left":44377151, "top":49045152}
 views = ['front', 'left', 'right', 'top']
