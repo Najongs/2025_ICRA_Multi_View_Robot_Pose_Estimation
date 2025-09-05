@@ -14,5 +14,5 @@ df = pd.DataFrame(summary, columns=columns)
 
 output_dir = "./Meca500"
 os.makedirs(output_dir, exist_ok=True)
-output_path = os.path.join(output_dir, "aruco_pose_summary.json")
+output_path = os.path.join(output_dir, "Meca500_aruco_pose_summary.json")
 df.to_json(output_path, orient="records", indent=2)
