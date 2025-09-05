@@ -19,15 +19,15 @@ JOINT_DATA_PATH = "../dataset/franka_research3/franka_research3_Joint_Angle"
 OUTPUT_SYNC_CSV_PATH = "../dataset/franka_research3/fr3_matched_joint_angle.csv"
 
 # 동기화 최대 허용 시간 차이 (초 단위)
-MAX_TIME_DIFFERENCE_THRESHOLD = 0.05
+MAX_TIME_DIFFERENCE_THRESHOLD = 0.02
 
-# --- ✨ 수정된 부분: 이미지 타임스탬프에 더해줄 고정 딜레이 값 ---
+# 이미지 타임스탬프에 더해줄 고정 딜레이 값
 IMAGE_TIMESTAMP_DELAY = 0.0333
 
-# --- 🛠️ 2. 헬퍼 함수 ---
+# --- 🛠️ 2. 헬퍼 함수 (기존과 동일) ---
 
 def process_yaml_to_df_records(yaml_path):
-    """하나의 YAML 파일을 읽어 데이터 레코드(딕셔너리)의 리스트를 반환합니다."""
+    """하나의 YAML 파일을 읽어 데이터 레코드(딕셔셔리)의 리스트를 반환합니다."""
     records = []
     with open(yaml_path, 'r') as f:
         try:
@@ -43,7 +43,7 @@ def process_yaml_to_df_records(yaml_path):
         stamp = doc.get('header', {}).get('stamp', {})
         sec = stamp.get('sec', 0)
         nanosec = stamp.get('nanosec', 0)
-        record['timestamp'] = float(f"{sec}.{nanosec:09d}"[:14])
+        record['robot_timestamp'] = float(f"{sec}.{nanosec:09d}"[:14]) # ✅ 컬럼명 명확화
 
         joint_names = doc.get('name', [])
         positions = doc.get('position', [])
@@ -72,21 +72,20 @@ def parse_image_timestamp(image_path):
     """이미지 파일명에서 타임스탬프를 float으로 추출합니다."""
     try:
         filename = os.path.basename(image_path)
-        parts = filename.replace('.jpg', '').replace('.png', '').replace('.jpeg', '').split('_')
+        parts = os.path.splitext(filename)[0].split('_')
         timestamp_str = parts[-1]
         return float(timestamp_str)
     except (IndexError, ValueError):
         return None
 
-# --- 🚀 3. 메인 실행 함수 ---
+# --- 🚀 3. 메인 실행 함수 (성능 개선 버전) ---
 
-def create_synchronized_dataset():
+def create_synchronized_dataset_fast():
     """
-    모든 로봇 데이터(YAML)와 이미지 데이터를 로드하고,
-    타임스탬프를 기준으로 동기화하여 하나의 CSV 파일로 저장합니다.
+    pandas.merge_asof를 사용하여 이미지와 로봇 데이터를 초고속으로 동기화합니다.
     """
     
-    # --- 단계 1: 모든 YAML 파일 로드 및 단일 로봇 데이터프레임 생성 ---
+    # --- 단계 1: 모든 로봇 데이터(YAML) 로드 및 데이터프레임 생성 ---
     print("--- 단계 1: 모든 로봇 관절 데이터(YAML) 로딩 및 통합 ---")
     all_joint_paths = glob.glob(os.path.join(JOINT_DATA_PATH, "joint_states_*.yaml"))
     
@@ -99,70 +98,75 @@ def create_synchronized_dataset():
         all_robot_records.extend(process_yaml_to_df_records(yaml_path))
         
     df_robot = pd.DataFrame(all_robot_records)
-    df_robot.sort_values('timestamp', inplace=True, ignore_index=True)
-    
-    print(f"✅ 총 {len(df_robot)}개의 로봇 데이터 포인트를 {len(all_joint_paths)}개 파일로부터 통합했습니다.\n")
+    df_robot.sort_values('robot_timestamp', inplace=True, ignore_index=True)
+    print(f"✅ 총 {len(df_robot)}개의 로봇 데이터 포인트를 통합했습니다.\n")
 
-    # --- 단계 2: 모든 이미지 파일 경로 스캔 ---
-    print("--- 단계 2: 모든 이미지 파일 스캔 ---")
+    # --- 단계 2: 모든 이미지 데이터를 데이터프레임으로 생성 ---
+    print("--- 단계 2: 모든 이미지 파일 스캔 및 데이터프레임 생성 ---")
     image_paths = find_image_files(IMAGE_BASE_DIRS)
-    print(f"✅ 총 {len(image_paths)}개의 이미지 파일을 찾았습니다.\n")
-
-    # --- 단계 3: 이미지와 로봇 데이터 타임스탬프 기준 동기화 ---
-    print("--- 단계 3: 이미지와 로봇 데이터 동기화 (이미지 딜레이 +{IMAGE_TIMESTAMP_DELAY}초 적용) ---")
-    synchronized_records = []
-    robot_timestamps = df_robot['timestamp'].values
-
-    for image_path in tqdm(image_paths, desc="이미지 매칭 중"):
-        img_ts = parse_image_timestamp(image_path)
-        if img_ts is None:
-            continue
-
-        # --- ✨ 수정된 부분: 이미지 타임스탬프에 딜레이를 더하여 매칭에 사용 ---
-        img_ts_for_matching = img_ts + IMAGE_TIMESTAMP_DELAY
-
-        # 가장 가까운 타임스탬프의 인덱스 찾기 (딜레이가 적용된 타임스탬프 기준)
-        time_diffs = np.abs(robot_timestamps - img_ts_for_matching)
-        closest_idx = np.argmin(time_diffs)
-        min_time_diff = time_diffs[closest_idx]
-
-        # 시간 차이가 설정된 임계값 이내인지 확인
-        if min_time_diff < MAX_TIME_DIFFERENCE_THRESHOLD:
-            matching_robot_row = df_robot.iloc[closest_idx]
+    
+    image_records = []
+    for path in tqdm(image_paths, desc="이미지 파일 처리 중"):
+        ts = parse_image_timestamp(path)
+        if ts is not None:
+            image_records.append({
+                'image_timestamp': ts,
+                'matching_timestamp': ts + IMAGE_TIMESTAMP_DELAY, # 딜레이를 더한 매칭용 타임스탬프
+                'image_path': path
+            })
             
-            record = {
-                'image_path': image_path,
-                'image_timestamp': img_ts, # CSV에는 원본 타임스탬프 기록
-                'robot_timestamp': matching_robot_row['timestamp'],
-                'time_difference_s': min_time_diff # 딜레이가 반영된 시간 차이
-            }
-            record.update(matching_robot_row.to_dict())
-            
-            synchronized_records.append(record)
+    df_image = pd.DataFrame(image_records)
+    df_image.sort_values('matching_timestamp', inplace=True, ignore_index=True)
+    print(f"✅ 총 {len(df_image)}개의 유효한 이미지 데이터를 통합했습니다.\n")
+    total_image_count = len(df_image)
+    
+    # --- 단계 3: `merge_asof`를 사용한 초고속 동기화 ---
+    print(f"--- 단계 3: `merge_asof`로 동기화 (허용 오차: {MAX_TIME_DIFFERENCE_THRESHOLD}초) ---")
+    
+    df_sync = pd.merge_asof(
+        left=df_image,
+        right=df_robot,
+        left_on='matching_timestamp',
+        right_on='robot_timestamp',
+        direction='nearest', # 가장 가까운 값 (절대값 기준)
+        tolerance=MAX_TIME_DIFFERENCE_THRESHOLD
+    )
+    
+    # 매칭되지 않은 행(NaN) 제거
+    df_sync.dropna(subset=['robot_timestamp'], inplace=True)
+    
+    # 실제 시간 차이 계산
+    df_sync['time_difference_s'] = (df_sync['matching_timestamp'] - df_sync['robot_timestamp']).abs()
+
 
     # --- 단계 4: 최종 결과 저장 ---
-    if not synchronized_records:
+    if df_sync.empty:
         print("\n❌ 매칭된 데이터가 없습니다. 결과 파일이 생성되지 않았습니다.")
         return
         
-    df_sync = pd.DataFrame(synchronized_records)
-    df_sync.sort_values('image_timestamp', inplace=True, ignore_index=True)
+    # 불필요한 매칭용 타임스탬프 컬럼 제거
+    df_sync.drop(columns=['matching_timestamp'], inplace=True)
     
     output_dir = os.path.dirname(OUTPUT_SYNC_CSV_PATH)
     os.makedirs(output_dir, exist_ok=True)
     
     df_sync.to_csv(OUTPUT_SYNC_CSV_PATH, index=False)
     
-    print("\n\n--- 🎉 동기화 완료 ---")
-    print(f"✅ 총 {len(df_sync)}개의 이미지-로봇 쌍이 성공적으로 동기화되었습니다.")
-    print(f"✅ 결과 저장 경로: {OUTPUT_SYNC_CSV_PATH}")
-    print("\n--- 동기화 데이터 샘플 (딜레이 적용 후) ---")
+    matched_count = len(df_sync)
+    unmatched_count = total_image_count - matched_count
     
-    # --- ✨ 수정된 부분: 샘플 출력에 타임스탬프 정보를 추가하여 확인 용이하게 변경 ---
+    print("\n\n--- 🎉 동기화 완료 ---")
+    print("\n--- 매칭 결과 요약 ---")
+    print(f"총 이미지 파일 수: {total_image_count}개")
+    print(f"✅ 매칭 성공: {matched_count}개")
+    print(f"❌ 매칭 실패: {unmatched_count}개")
+    print(f"\n✅ 결과 저장 경로: {OUTPUT_SYNC_CSV_PATH}")
+    print("\n--- 동기화 데이터 샘플 ---")
+    
     sample_cols = ['image_timestamp', 'robot_timestamp', 'time_difference_s', 'position_fr3_joint1']
     display_cols = [col for col in sample_cols if col in df_sync.columns]
     print(df_sync[display_cols].head())
 
 
 if __name__ == '__main__':
-    create_synchronized_dataset()
+    create_synchronized_dataset_fast()
