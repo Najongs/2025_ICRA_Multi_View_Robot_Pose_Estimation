@@ -494,14 +494,83 @@ def visualize_predictions(model, dataset, device, config, epoch_num, num_samples
         # plt.show()
     return fig
 
+def log_predictions_to_wandb(model, images, gt_heatmaps, gt_angles, device, config, title):
+    """
+    주어진 데이터 배치를 사용하여 모델 예측을 시각화하고 wandb에 로깅합니다.
+    """
+    model.eval() # 평가 모드로 전환
+    
+    # 역정규화를 위한 값
+    mean = np.array(config['mean'])
+    std = np.array(config['std'])
+    
+    log_images = []
+    
+    with torch.no_grad():
+        # 입력된 이미지 배치 전체에 대해 예측 수행
+        images_to_device = images.to(device)
+        pred_heatmaps_batch, pred_angles_batch = model(images_to_device)
+
+    # 배치 내 각 이미지에 대해 시각화 자료 생성 (최대 5개)
+    for i in range(min(images.shape[0], 5)):
+        img_tensor = images[i]
+        
+        # 텐서를 시각화용 Numpy 배열로 변환 및 역정규화
+        img_np = img_tensor.cpu().numpy().transpose((1, 2, 0))
+        img_np = std * img_np + mean
+        img_np = np.clip(img_np * 255, 0, 255).astype(np.uint8)
+        img_h, img_w, _ = img_np.shape
+        
+        # BGR 변환 (OpenCV는 BGR 순서를 사용)
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        # --- GT 시각화 ---
+        gt_hmap = gt_heatmaps[i]
+        gt_ang = gt_angles[i]
+        gt_composite_hmap = torch.sum(gt_hmap, dim=0).cpu().numpy()
+        gt_heatmap_resized = cv2.resize(gt_composite_hmap, (img_w, img_h))
+        gt_vis = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        gt_vis = cv2.cvtColor(gt_vis, cv2.COLOR_GRAY2BGR)
+        gt_vis = cv2.addWeighted(gt_vis, 0.3, cv2.applyColorMap((gt_heatmap_resized * 255).astype(np.uint8), cv2.COLORMAP_JET), 0.7, 0)
+
+        # --- 예측 시각화 ---
+        pred_hmap = pred_heatmaps_batch[i].cpu()
+        pred_ang = pred_angles_batch[i].cpu()
+        pred_composite_hmap = torch.sum(pred_hmap, dim=0).numpy()
+        pred_heatmap_resized = cv2.resize(pred_composite_hmap, (img_w, img_h))
+        pred_vis = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        pred_vis = cv2.cvtColor(pred_vis, cv2.COLOR_GRAY2BGR)
+        pred_vis = cv2.addWeighted(pred_vis, 0.3, cv2.applyColorMap((pred_heatmap_resized * 255).astype(np.uint8), cv2.COLORMAP_JET), 0.7, 0)
+
+        # --- 텍스트 추가 ---
+        gt_text = "GT Angles: " + ", ".join([f"{a:.2f}" for a in gt_ang.numpy()])
+        pred_text = "Pred Angles: " + ", ".join([f"{a:.2f}" for a in pred_ang.numpy()])
+        cv2.putText(gt_vis, "Ground Truth", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(pred_vis, "Prediction", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        
+        # --- 이미지 병합 ---
+        comparison_image = cv2.hconcat([img_bgr, gt_vis, pred_vis])
+        
+        # wandb 로깅을 위해 PIL 이미지로 변환
+        final_image = Image.fromarray(cv2.cvtColor(comparison_image, cv2.COLOR_BGR2RGB))
+        log_images.append(wandb.Image(final_image, caption=f"{gt_text}\n{pred_text}"))
+        
+    # wandb에 이미지 리스트 로깅
+    wandb.log({title: log_images})
+    model.train() # 모델을 다시 학습 모드로 전환
+    
 def train_one_epoch(model, loader, optimizer_kpt, optimizer_ang, crit_kpt, crit_ang, device, loss_weight_kpt=1.0, epoch_num=0):
     model.train()
     total_loss_kpt = 0
     total_loss_ang = 0
+    first_batch = None # 첫 배치를 저장할 변수
     
     loop = tqdm(loader, desc=f"Epoch {epoch_num} [Train]")
     
-    for images, heatmaps, angles in loop:
+    for i, (images, heatmaps, angles) in enumerate(loop):
+        if i == 0: # ✅ 첫 번째 배치 저장
+            first_batch = (images.cpu(), heatmaps.cpu(), angles.cpu())
+
         images, heatmaps, angles = images.to(device), heatmaps.to(device), angles.to(device)
         
         pred_heatmaps, pred_angles = model(images)
@@ -528,15 +597,20 @@ def train_one_epoch(model, loader, optimizer_kpt, optimizer_ang, crit_kpt, crit_
     # 평균 손실 반환
     avg_loss_kpt = total_loss_kpt / len(loader)
     avg_loss_ang = total_loss_ang / len(loader)
-    return avg_loss_kpt, avg_loss_ang
+    return avg_loss_kpt, avg_loss_ang, first_batch 
 
 def validate(model, loader, crit_kpt, crit_ang, device, loss_weight_kpt=1.0, epoch_num=0):
     model.eval()
     total_loss = 0
-    loop = tqdm(loader, desc=f"Epoch {epoch_num} [Validate]", leave=False) # leave=False로 설정하면 완료 후 바가 사라짐
+    first_batch = None # 첫 배치를 저장할 변수
+    
+    loop = tqdm(loader, desc=f"Epoch {epoch_num} [Validate]", leave=False)
     
     with torch.no_grad():
-        for images, heatmaps, angles in loop:
+        for i, (images, heatmaps, angles) in enumerate(loop):
+            if i == 0: # ✅ 첫 번째 배치 저장
+                first_batch = (images.cpu(), heatmaps.cpu(), angles.cpu())
+                
             images, heatmaps, angles = images.to(device), heatmaps.to(device), angles.to(device)
             
             pred_heatmaps, pred_angles = model(images)
@@ -548,7 +622,7 @@ def validate(model, loader, crit_kpt, crit_ang, device, loss_weight_kpt=1.0, epo
             total_loss += loss.item()
             loop.set_postfix(loss=loss.item())
             
-    return total_loss / len(loader)
+    return total_loss / len(loader), first_batch
 
 class RandomMasking(object):
     """
@@ -732,8 +806,16 @@ def main():
     for epoch in range(hyperparameters['num_epochs']):
         train_sampler.set_epoch(epoch)
         
-        train_loss_kpt, train_loss_ang = train_one_epoch(model, train_loader, optimizer_kpt, optimizer_ang, crit_kpt, crit_ang, torch.device(f'cuda:{local_rank}'), hyperparameters['loss_weight_kpt'], epoch+1)
-        val_loss = validate(model, val_loader, crit_kpt, crit_ang, torch.device(f'cuda:{local_rank}'), hyperparameters['loss_weight_kpt'], epoch+1)
+        # ✅ 반환값에 first_train_batch 추가
+        train_loss_kpt, train_loss_ang, first_train_batch = train_one_epoch(
+            model, train_loader, optimizer_kpt, optimizer_ang, crit_kpt, crit_ang, 
+            torch.device(f'cuda:{local_rank}'), hyperparameters['loss_weight_kpt'], epoch+1
+        )
+        # ✅ 반환값에 first_val_batch 추가
+        val_loss, first_val_batch = validate(
+            model, val_loader, crit_kpt, crit_ang, 
+            torch.device(f'cuda:{local_rank}'), hyperparameters['loss_weight_kpt'], epoch+1
+        )
         
         scheduler_kpt.step()
         scheduler_ang.step()
@@ -743,8 +825,28 @@ def main():
             current_lr_ang = optimizer_ang.param_groups[0]['lr']
             print(f"Epoch {epoch+1}/{hyperparameters['num_epochs']} -> Train Losses [Kpt: {train_loss_kpt:.6f}, Ang: {train_loss_ang:.6f}], Val Loss: {val_loss:.6f}, LR [Kpt: {current_lr_kpt:.6f}, Ang: {current_lr_ang:.6f}]")
             
-            wandb.log({"epoch": epoch + 1, "train_loss_kpt": train_loss_kpt, "train_loss_ang": train_loss_ang, "avg_val_loss": val_loss, "lr_kpt": current_lr_kpt, "lr_ang": current_lr_ang})
+            # ✅ WandB에 숫자 메트릭 로깅
+            wandb.log({
+                "epoch": epoch + 1, 
+                "train_loss_kpt": train_loss_kpt, 
+                "train_loss_ang": train_loss_ang, 
+                "avg_val_loss": val_loss, 
+                "lr_kpt": current_lr_kpt, 
+                "lr_ang": current_lr_ang
+            })
 
+            # ✅ WandB에 이미지 로깅
+            # 검증 샘플은 매 에포크마다 로깅
+            if first_val_batch[0] is not None:
+                log_predictions_to_wandb(model.module, first_val_batch[0], first_val_batch[1], first_val_batch[2], 
+                                         torch.device(f'cuda:{local_rank}'), config, "Validation Predictions")
+            
+            # 학습 샘플은 10 에포크마다 로깅 (너무 자주 로깅하는 것을 방지)
+            if (epoch + 1) % 10 == 0 and first_train_batch[0] is not None:
+                log_predictions_to_wandb(model.module, first_train_batch[0], first_train_batch[1], first_train_batch[2], 
+                                         torch.device(f'cuda:{local_rank}'), config, "Train Predictions")
+
+            # (기존 모델 저장 로직은 동일)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 print(f"  -> 🎉 New best model saved with validation loss: {best_val_loss:.6f}")
