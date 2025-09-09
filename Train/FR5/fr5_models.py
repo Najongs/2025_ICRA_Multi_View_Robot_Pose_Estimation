@@ -44,9 +44,6 @@ class FR5FK(nn.Module):
             pts.append(T[..., :3, 3])
         return torch.stack(pts, dim=1)            # [B, 7, 3]
 
-
-
-
 # -----------------------------
 # Backbone
 # -----------------------------
