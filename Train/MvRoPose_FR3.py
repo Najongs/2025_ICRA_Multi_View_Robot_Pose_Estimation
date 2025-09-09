@@ -1154,6 +1154,30 @@ def setup(hyperparameters, dataset_groups, rank, world_size):
     train_dataset = RobotPoseDataset(groups=train_groups, transform=train_transform)
     val_dataset = RobotPoseDataset(groups=val_groups, transform=val_transform)
     
+    # === [ADD] 모든 샘플을 (가볍게) 훑어서 view_key 전체 집합 수집 ===
+    def _collect_all_view_keys(ds, max_scans=2000):
+        keys = set()
+        scanned = 0
+        # 너무 많은 디스크 I/O를 피하려면 샘플링하며 훑기
+        idxs = list(range(len(ds)))
+        random.shuffle(idxs)
+        for i in idxs:
+            if scanned >= max_scans:
+                break
+            sample = ds[i]
+            if sample[0] is None:
+                continue
+            keys.update(sample[0].keys())
+            scanned += 1
+        return sorted(keys)
+
+    all_view_keys = sorted(set(_collect_all_view_keys(train_dataset, max_scans=5000) +
+                            _collect_all_view_keys(val_dataset,   max_scans=2000)))
+
+    if not all_view_keys:
+        raise RuntimeError("No valid view keys found in datasets.")
+
+    
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
     
@@ -1211,12 +1235,12 @@ def setup(hyperparameters, dataset_groups, rank, world_size):
 
     # DataLoader: drop_last=True 로 꼬리 배치 미스매치 예방, persistent_workers로 I/O 안정화
     train_loader = DataLoader(
-        train_dataset, batch_size=hyperparameters['batch_size'], num_workers=8,
+        train_dataset, batch_size=hyperparameters['batch_size'], num_workers=16,
         collate_fn=collate_fn, pin_memory=True, sampler=train_sampler,
         drop_last=True, persistent_workers=True
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=hyperparameters['batch_size'], num_workers=8,
+        val_dataset, batch_size=hyperparameters['batch_size'], num_workers=16,
         collate_fn=collate_fn, pin_memory=True, sampler=val_sampler,
         drop_last=False, persistent_workers=True
     )
@@ -1225,9 +1249,10 @@ def setup(hyperparameters, dataset_groups, rank, world_size):
     # tmpl_all_keys는 위에서 템플릿 샘플로부터 이미 확보됨
     model = DINOv3PoseEstimator(
         model_name=hyperparameters['model_name'],
-        known_view_keys=tmpl_all_keys  # ★ 뷰 키 고정 주입
+        known_view_keys=all_view_keys  # ★ 모든 키 집합 주입
     ).to(device)
     model = DDP(model, device_ids=[rank], find_unused_parameters=True, gradient_as_bucket_view=False)
+
 
     
     criteria = {'kpt': nn.MSELoss(), 'ang': nn.SmoothL1Loss(beta=1.0)}
