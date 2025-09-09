@@ -18,12 +18,6 @@ DINOv3/
 wandb/
 
 results/
-DREAM_real/
-Fr5/
-franka_research3/
-Meca_insertion/
-Meca500/
-
 # C extensions
 *.so
 
