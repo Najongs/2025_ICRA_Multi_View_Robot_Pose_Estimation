@@ -378,7 +378,7 @@ def setup(hyperparameters, dataset_groups, rank, world_size):
     def build_base_transform(mean, std, resize_size=224, crop_size=224):
         return transforms.Compose([
             transforms.Resize(resize_size),
-            transforms.CenterCrop(crop_size),
+            # transforms.CenterCrop(crop_size),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ])
@@ -386,7 +386,7 @@ def setup(hyperparameters, dataset_groups, rank, world_size):
     def build_strong_transform(mean, std, resize_size=224, crop_size=224):
         return transforms.Compose([
             transforms.Resize(resize_size),
-            transforms.CenterCrop(crop_size),
+            # transforms.CenterCrop(crop_size),
             transforms.ColorJitter(brightness=0.2, contrast=0.15, saturation=0.15, hue=0.05),
             transforms.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 2.0)),
             transforms.RandomGrayscale(p=0.1),
@@ -668,7 +668,7 @@ def main():
 
     vis_transform = transforms.Compose([
         transforms.Resize(resize_size),
-        transforms.CenterCrop(crop_size),
+        # transforms.CenterCrop(crop_size),
         transforms.ToTensor(),
         transforms.Normalize(mean=dino_mean, std=dino_std),
     ])

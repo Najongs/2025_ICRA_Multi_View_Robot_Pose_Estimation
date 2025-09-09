@@ -100,9 +100,8 @@ class RobotPoseDataset(Dataset):
                 dist = np.array(calib["distortion_coeffs"], dtype=np.float64).reshape(-1,1)
 
                 # 어떤 pose 세트인지 추정
-                pose_tag = 'pose1' if ('pose1' in img_path or 'pose1' in raw_path) else 'pose2'
                 # ArUco key 우선순위
-                aruco = ( self.aruco_lookup.get(f"{pose_tag}_{view}_{cam_key}")
+                aruco = ( self.aruco_lookup.get(f"{view}_{cam_key}")
                           or self.aruco_lookup[f"{view}_{cam_key}"] )
 
                 # Read + undistort with K_new
@@ -117,29 +116,66 @@ class RobotPoseDataset(Dataset):
                 # FK → 3D joints (meters), view-base correction inside
                 joints_3d = angle_to_joint_coordinate(joint_angles_rad, view)
 
-                # 3D→2D with K_new, dist=None
-                kpts_2d = project_3d_to_2d(joints_3d, aruco, K_new, dist=None)  # (7,2), float32
+                # 3D→2D with K_new, dist=None  (픽셀 좌표: undist 기준)
+                kpts_2d = project_3d_to_2d(joints_3d, aruco, K_new, dist=None)  # (J,2), float32
 
-                # Heatmap 스케일 정합 (원본 undist 크기 기준)
+                # -----------------------------
+                # 🔴 여기부터 "Resize→CenterCrop(224)"를
+                #     이미지와 키포인트에 동일하게 적용
+                # -----------------------------
+                resize_size = 224
+                crop_size   = 224
+
+                # 1) torchvision.Resize(resize_size)와 동일한 규칙(짧은 변을 resize_size로)
+                if h < w:
+                    new_h = resize_size
+                    scale = new_h / h
+                    new_w = int(round(w * scale))
+                else:
+                    new_w = resize_size
+                    scale = new_w / w
+                    new_h = int(round(h * scale))
+
+                # 2) 좌표에 스케일 적용 (undist → resized)
+                kpts_after_resize = kpts_2d.copy()
+                kpts_after_resize[:, 0] *= (new_w / w)
+                kpts_after_resize[:, 1] *= (new_h / h)
+
+                # 3) CenterCrop(crop_size) 오프셋 계산 (긴 변에서 중앙 crop_size만 남김)
+                off_x = max(0, (new_w - crop_size) // 2)
+                off_y = max(0, (new_h - crop_size) // 2)
+
+                # 4) 좌표에 오프셋 적용 (resized → cropped)
+                kpts_after_crop = kpts_after_resize.copy()
+                kpts_after_crop[:, 0] -= off_x
+                kpts_after_crop[:, 1] -= off_y
+
+                # 5) 이미지에도 동일 변환 적용 (시각화/모델 입력 정합)
+                resized = cv2.resize(undist, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                cropped = resized[off_y:off_y+crop_size, off_x:off_x+crop_size]
+
+                # 6) Heatmap 좌표 스케일 (crop_size → heatmap_size)
                 Ht, Wt = self.heatmap_size
-                sx, sy = (Wt / w), (Ht / h)
-                kpts_scaled = np.empty_like(kpts_2d)
-                kpts_scaled[:, 0] = kpts_2d[:, 0] * sx
-                kpts_scaled[:, 1] = kpts_2d[:, 1] * sy
+                sx = Wt / crop_size
+                sy = Ht / crop_size
+                kpts_hm = np.empty_like(kpts_after_crop, dtype=np.float32)
+                kpts_hm[:, 0] = kpts_after_crop[:, 0] * sx
+                kpts_hm[:, 1] = kpts_after_crop[:, 1] * sy
 
-                # Heatmaps
+                # 7) 히트맵 생성
                 num_joints = joints_3d.shape[0]
                 heatmaps = np.zeros((num_joints, Ht, Wt), dtype=np.float32)
                 for j in range(num_joints):
-                    heatmaps[j] = create_gt_heatmap(kpts_scaled[j], self.heatmap_size, self.sigma)
+                    heatmaps[j] = create_gt_heatmap(kpts_hm[j], (Ht, Wt), self.sigma)
 
-                # To tensor
-                img_pil = Image.fromarray(undist)
-                img_tensor = self.transform(img_pil) if self.transform else torch.from_numpy(undist).permute(2,0,1).float()/255.
+                # 8) 이미지 텐서는 "크롭된 224×224"로 transform
+                img_pil = Image.fromarray(cropped)
+                img_tensor = self.transform(img_pil) if self.transform else torch.from_numpy(cropped).permute(2,0,1).float()/255.
 
                 view_key = f"{serial}_{cam_type}"  # 예: "38007749_left"
-                image_dict[view_key] = img_tensor
+                image_dict[view_key]   = img_tensor
                 heatmaps_dict[view_key] = torch.from_numpy(heatmaps)  # (J,H,W) float32
+
 
             return image_dict, heatmaps_dict, gt_angles
         except Exception as e:
