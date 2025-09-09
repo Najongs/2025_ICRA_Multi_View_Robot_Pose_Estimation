@@ -7,7 +7,7 @@ camera_list = {
     30779426: "top",
     34850673: "right",
     38007749: "left",
-    30695000: "top"
+#    30695000: "top"
 }
 
 zed_conf_dir = "./All_camera_conf"
