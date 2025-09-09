@@ -8,7 +8,10 @@ torchrun --nproc_per_node=3 fr5_main.py
 """
 
 import os
-os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+# NCCL env: deprecated → TORCH_NCCL_ASYNC_ERROR_HANDLING 로 교체
+os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+
 
 import time
 import random
@@ -19,11 +22,12 @@ import cv2
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, LinearLR
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
@@ -41,7 +45,12 @@ from fr5_utils import (
     perform_grouping,
 )
 from fr5_dataset import RobotPoseDataset
-from fr5_models import DINOv3PoseEstimator, FR5FK
+from fr5_models import (
+    DINOv3PoseEstimator, FR5FK,
+    weighed_kpt_loss,                     # ② 엔트로피 가중 키포인트 손실
+    VonMisesAngleLoss, CosineAngleLoss,  # ① 각도 손실 구성요소
+    make_angle_loss                      # ① von Mises + cosine 합성
+)
 from fr5_vis import (
     visualize_samples_by_group_size,
     visualize_dataset_sample,
@@ -63,28 +72,41 @@ def _proj_path(*parts):
     """프로젝트 루트 기준 절대경로 생성(결과물/체크포인트 저장용)"""
     return os.path.abspath(os.path.join(_PROJECT_ROOT, *parts))
 
+
+# ================================================================
+# AMP 유틸 (CPU에서도 안전하게 동작하도록 No-Op Scaler)
+# ================================================================
+class _NoOpScaler:
+    def scale(self, loss): return loss
+    def step(self, optimizer): optimizer.step()
+    def update(self): pass
+    def unscale_(self, optimizer): pass
+
+
 # ================================================================
 # Train / Validate
 # ================================================================
-def train_one_epoch(model, loader, optimizers, criteria, device, loss_weight_kpt, epoch_num, param_sets):
+def train_one_epoch(model, loader, optimizers, criteria, device, loss_weight_kpt, epoch_num, param_sets, scalers):
     """
-    두 번의 독립 forward:
-      (1) forward_A → (angle loss + lambda_fk * FK 좌표 loss) backward/step
-      (2) forward_B → keypoint loss backward/step
-    + DDP 동기화용 더미 스텝 포함
+    AMP + 두 경로 분리 업데이트:
+      (A) angle  : with autocast + GradScaler + no_sync (통신 최소화)
+      (B) keypoint: with autocast + GradScaler + 동기 backward (allreduce 1회)
+    grad 마스킹/clip, OOM 가드 유지
     """
     import torch
     import torch.distributed as dist
     import math
+
+    scaler_kpt, scaler_ang = scalers['kpt'], scalers['ang']
 
     model.train()
     total_loss_kpt, total_loss_ang = 0.0, 0.0
     num_effective_batches = 0
 
     optimizer_kpt, optimizer_ang = optimizers['kpt'], optimizers['ang']
-    crit_kpt, crit_ang = criteria['kpt'], criteria['ang']
-    fk = criteria['fk']                    # FR5FK 모듈 (미분가능)
-    lambda_fk = criteria.get('lambda_fk', 0.0)  # 보조 가중치 (없으면 0)
+    crit_ang = criteria['ang']
+    fk = criteria['fk']
+    lambda_fk = criteria.get('lambda_fk', 0.0)
 
     m = model.module if hasattr(model, 'module') else model
     kpt_ids = param_sets['kpt']
@@ -113,7 +135,6 @@ def train_one_epoch(model, loader, optimizers, criteria, device, loss_weight_kpt
         has_data_all = torch.tensor(has_data_local, device=device)
         dist.all_reduce(has_data_all, op=dist.ReduceOp.SUM)
         has_any_rank_data = int(has_data_all.item())
-
         if not has_any_rank_data:
             loop.set_postfix(loss_kpt='skip_all', loss_ang='skip_all')
             continue
@@ -126,71 +147,74 @@ def train_one_epoch(model, loader, optimizers, criteria, device, loss_weight_kpt
         try:
             images_gpu   = {k: v.to(device, non_blocking=True) for k, v in image_dict.items()}
             heatmaps_gpu = {k: v.to(device, non_blocking=True) for k, v in gt_heatmaps_dict.items()}
-            angles_gpu   = gt_angles.to(device, non_blocking=True)  # (B, A) in deg
+            angles_gpu   = gt_angles.to(device, non_blocking=True)  # (B, A) deg
 
-            # ---- (A) angle 경로 ----
+            # =========================
+            # (A) ANGLE 경로  — no_sync
+            # =========================
             optimizer_ang.zero_grad(set_to_none=True)
             optimizer_kpt.zero_grad(set_to_none=True)
 
-            # ❌ with model.no_sync():  # 제거
-            _, pred_angles_A = model(images_gpu)
-            loss_ang = crit_ang(pred_angles_A, angles_gpu)
+            with torch.amp.autocast('cuda', dtype=torch.float16):
+                _, pred_angles_A = model(images_gpu)                     # (B,A,2)
+                loss_ang = crit_ang(pred_angles_A, angles_gpu)
 
-            with torch.no_grad():
-                pred_rad = torch.atan2(pred_angles_A[...,0], pred_angles_A[...,1])  # [B, A] rad
+                pred_rad = torch.atan2(pred_angles_A[..., 0], pred_angles_A[..., 1])
                 pred_deg = pred_rad * (180.0 / math.pi)
-            pred_pts = fk(pred_deg)   # [B, 9, 3]
-            gt_pts   = fk(angles_gpu) # [B, 9, 3]
-            loss_fk  = F.mse_loss(pred_pts, gt_pts)
+                pred_pts = fk(pred_deg)                                  # (B,7(or 9),3)
+                gt_pts   = fk(angles_gpu)
+                loss_fk  = F.smooth_l1_loss(pred_pts, gt_pts, beta=2.0)
 
-            loss_ang_total = loss_ang + lambda_fk * loss_fk
+                loss_ang_total = loss_ang + lambda_fk * loss_fk
 
-            loss_ang_total.backward()
-            # ... (grad masking → clip → optimizer_ang.step()) 동일
+            # 첫 backward는 통신 생략
+            with model.no_sync():
+                scaler_ang.scale(loss_ang_total).backward()
 
-
-            # grad 마스킹은 그대로 유지
+            # unscale → 마스킹 → clip → step
+            scaler_ang.unscale_(optimizer_ang)
             for p in m.parameters():
                 if p.grad is None:
                     continue
                 if id(p) not in ang_ids:
                     p.grad.detach_()
                     p.grad.zero_()
-
             torch.nn.utils.clip_grad_norm_(m.parameters(), max_norm=1.0)
-            optimizer_ang.step()
+            scaler_ang.step(optimizer_ang)
+            scaler_ang.update()
 
-
-            # ---- (B) keypoint 경로 ----
+            # =========================
+            # (B) KEYPOINT 경로 — 동기 backward (allreduce 발생)
+            # =========================
             optimizer_kpt.zero_grad(set_to_none=True)
-            pred_heatmaps_B, _ = model(images_gpu)
 
-            real_view_keys = list(pred_heatmaps_B.keys())
-            loss_kpt = torch.stack(
-                [crit_kpt(pred_heatmaps_B[k], heatmaps_gpu[k]) for k in real_view_keys]
-            ).mean() * loss_weight_kpt
+            with torch.amp.autocast('cuda', dtype=torch.float16):
+                pred_heatmaps_B, _ = model(images_gpu)
+                loss_kpt = weighed_kpt_loss(pred_heatmaps_B, heatmaps_gpu, m.softarg) * loss_weight_kpt
 
             if not torch.isfinite(loss_kpt):
                 _dummy_sync_step()
                 loop.set_postfix(loss_kpt='nan_guard', loss_ang=f"{loss_ang_total.item():.4f}")
                 continue
 
-            loss_kpt.backward()
+            # 두 번째 backward는 통신 동기화(기본)
+            scaler_kpt.scale(loss_kpt).backward()
 
-            # kpt 파라미터만 업데이트
+            scaler_kpt.unscale_(optimizer_kpt)
             for p in m.parameters():
                 if p.grad is None:
                     continue
                 if id(p) not in kpt_ids:
                     p.grad.detach_()
                     p.grad.zero_()
-
             torch.nn.utils.clip_grad_norm_(m.parameters(), max_norm=1.0)
-            optimizer_kpt.step()
+            scaler_kpt.step(optimizer_kpt)
+            scaler_kpt.update()
 
             total_loss_kpt += float(loss_kpt.item())
             total_loss_ang += float(loss_ang_total.item())
             num_effective_batches += 1
+
             loop.set_postfix(
                 loss_kpt=f"{loss_kpt.item():.4f}",
                 loss_ang=f"{loss_ang_total.item():.4f}",
@@ -213,28 +237,28 @@ def train_one_epoch(model, loader, optimizers, criteria, device, loss_weight_kpt
     return total_loss_kpt / denom, total_loss_ang / denom
 
 
-
-def validate(model, loader, criteria, device, loss_weight_kpt, epoch_num):
+def validate(model, loader, criteria, device, loss_weight_kpt, epoch_num, amp_enabled=True):
     """
     검증 루프 + 지표:
     - Loss: kpt/ang 분리, total = kpt*weight + (ang + lambda_fk*fk)
     - Metric: angle MAE(deg), heatmap argmax L2-px (128x128), (옵션) FK position MAE
+    - AMP 지원(autocast)으로 추론 가속
     """
     import torch
     import torch.distributed as dist
     import math
 
     model.eval()
-    crit_kpt, crit_ang = criteria['kpt'], criteria['ang']
     fk = criteria['fk']
+    angle_crit = criteria['ang']
     lambda_fk = criteria.get('lambda_fk', 0.0)
 
     total_val_loss = 0.0
     total_val_kpt  = 0.0
-    total_val_ang  = 0.0               # 여기엔 ang + lambda_fk*fk 포함해 기록
+    total_val_ang  = 0.0
     total_ang_mae  = 0.0
     total_kpt_px   = 0.0
-    total_fk_mae   = 0.0               # (선택) FK 위치 MAE(m)
+    total_fk_mae   = 0.0
     num_effective  = 0
 
     try:
@@ -272,24 +296,25 @@ def validate(model, loader, criteria, device, loss_weight_kpt, epoch_num):
             heatmaps_gpu = {k: v.to(device, non_blocking=True) for k, v in gt_heatmaps_dict.items()}
             angles_gpu   = gt_angles.to(device, non_blocking=True)  # (B,A) deg
 
-            pred_heatmaps, pred_angles = model(images_gpu)          # pred_angles: (B,A,2)
+            # AMP 추론
+            with torch.amp.autocast('cuda', dtype=torch.float16, enabled=amp_enabled):
+                pred_heatmaps, pred_angles = model(images_gpu)  # pred_angles: (B,A,2)
 
-            real_view_keys = list(pred_heatmaps.keys())
-            loss_kpt = torch.stack(
-                [crit_kpt(pred_heatmaps[k], heatmaps_gpu[k]) for k in real_view_keys]
-            ).mean() * loss_weight_kpt
+                # 키포인트 손실 (학습과 동일한 함수)
+                softarg_ref = getattr(model.module if hasattr(model, "module") else model, "softarg")
+                loss_kpt = weighed_kpt_loss(pred_heatmaps, heatmaps_gpu, softarg_ref) * loss_weight_kpt
 
-            # 각도 벡터 손실
-            loss_ang = crit_ang(pred_angles, angles_gpu)
+                # 각도 손실
+                loss_ang = angle_crit(pred_angles, angles_gpu)
 
-            # FK 보조 항
-            pred_deg = torch.atan2(pred_angles[..., 0], pred_angles[..., 1]) * (180.0 / math.pi)
-            gt_deg   = angles_gpu
-            pred_pts = fk(pred_deg)   # (B,A+1,3)
-            gt_pts   = fk(gt_deg)     # (B,A+1,3)
-            fk_loss  = F.smooth_l1_loss(pred_pts, gt_pts)
+                # FK 보조 항
+                pred_deg = torch.atan2(pred_angles[..., 0], pred_angles[..., 1]) * (180.0 / math.pi)
+                gt_deg   = angles_gpu
+                pred_pts = fk(pred_deg)
+                gt_pts   = fk(gt_deg)
+                fk_loss  = F.smooth_l1_loss(pred_pts, gt_pts, beta=2.0)
 
-            loss_ang_total = loss_ang + (lambda_fk * fk_loss)
+                loss_ang_total = loss_ang + (lambda_fk * fk_loss)
 
             if (not torch.isfinite(loss_kpt)) or (not torch.isfinite(loss_ang_total)):
                 if rank == 0 and isinstance(loop, tqdm): loop.set_postfix_str("nan_guard")
@@ -311,6 +336,7 @@ def validate(model, loader, criteria, device, loss_weight_kpt, epoch_num):
             ang_mae = torch.mean(torch.abs(diff)).item()
 
             # --- 히트맵 argmax L2 픽셀오차(128x128 기준) ---
+            real_view_keys = list(pred_heatmaps.keys())
             per_view_err = []
             for k in real_view_keys:
                 per_view_err.append(_batch_heatmap_l2_px(pred_heatmaps[k], heatmaps_gpu[k]))
@@ -336,7 +362,7 @@ def validate(model, loader, criteria, device, loss_weight_kpt, epoch_num):
     denom = max(1, num_effective)
     avg_total = total_val_loss / denom
     avg_kpt   = total_val_kpt  / denom
-    avg_ang   = total_val_ang  / denom                      # ang + lambda_fk*fk
+    avg_ang   = total_val_ang  / denom
     avg_ang_mae_deg  = total_ang_mae / denom
     avg_kpt_l2px_128 = total_kpt_px  / denom
     avg_fk_mae_m     = total_fk_mae  / denom
@@ -348,6 +374,7 @@ def validate(model, loader, criteria, device, loss_weight_kpt, epoch_num):
               f"fk_pos_MAE_m={avg_fk_mae_m:.4f}")
 
     return avg_total, avg_kpt, avg_ang, avg_ang_mae_deg, avg_kpt_l2px_128
+
 
 
 # ================================================================
@@ -362,6 +389,7 @@ def setup_ddp():
 def cleanup_ddp():
     dist.destroy_process_group()
 
+
 # ================================================================
 # Experiment setup (datasets, loaders, model, opt, sched)
 # ================================================================
@@ -374,14 +402,15 @@ def setup(hyperparameters, dataset_groups, rank, world_size):
     std  = [0.229, 0.224, 0.225]
     resize_size = 224  # 현재 파이프라인은 resize-only
 
-    def build_base_transform(mean, std, resize_size=224, crop_size=224):
+    def build_base_transform(mean, std, resize_size=224):
         return transforms.Compose([
             transforms.Resize((resize_size, resize_size)),  # 224x224로 강제 워핑
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ])
 
-    def build_strong_transform(mean, std, resize_size=224, crop_size=224):
+    def build_strong_transform(mean, std, resize_size=224):
+        # 8번: 색/노이즈는 독립, 기하 왜곡은 작게 유지(멀티뷰 정합 보호)
         return transforms.Compose([
             transforms.Resize((resize_size, resize_size)),  # crop 제거
             transforms.ColorJitter(brightness=0.2, contrast=0.15, saturation=0.15, hue=0.05),
@@ -489,34 +518,36 @@ def setup(hyperparameters, dataset_groups, rank, world_size):
     ).to(device)
     model = DDP(model, device_ids=[rank], find_unused_parameters=True, gradient_as_bucket_view=False)
 
-    # 각도: deg → (sin,cos)
-    def deg_to_unitvec(deg: torch.Tensor):
-        rad = deg * math.pi / 180.0
-        return torch.stack([torch.sin(rad), torch.cos(rad)], dim=-1)  # (B, num_angles, 2)
-    
+    # ① 각도 손실: von Mises + cosine
+    angle_loss = make_angle_loss(NUM_ANGLES, vm_weight=0.5, cos_weight=0.5)
+
+    # FK 모듈    # --- Angle loss: von Mises + Cosine ---
+    angle_loss = make_angle_loss(NUM_ANGLES, vm_weight=0.5, cos_weight=0.5)
+    # κ 파라미터를 rank 디바이스로 이동
+    if hasattr(angle_loss, "vm"):
+        angle_loss.vm = angle_loss.vm.to(device)
+
     fk = FR5FK(device)
     criteria = {
-        'kpt': nn.MSELoss(),
-        'ang': lambda pred_vec, gt_deg: F.mse_loss(
-            pred_vec, deg_to_unitvec(gt_deg.to(pred_vec.device))
-        ),
+        'kpt': nn.MSELoss(),   # 실제 kpt 손실은 weighed_kpt_loss에서 사용
+        'ang': angle_loss,
         'fk': fk
     }
-    criteria['lambda_fk'] = hyperparameters.get('lambda_fk', 0.1)
-
+    criteria['lambda_fk'] = hyperparameters.get('lambda_fk', 0.5)
 
     m = model.module
     params_shared = list(m.view_embeddings.parameters()) + list(m.fusion.parameters())
 
-    # ✅ angle 경로에서 사용되는 토큰 인코더를 angle optimizer에 포함
+    # ✅ angle 경로: κ 파라미터까지 포함해 학습
     params_ang = (
         list(m.ang_head.parameters())
         + params_shared
-        + list(m.kp_token_enc.parameters())   # ← 추가!
-        + list(m.cnn_token_enc.parameters())  # ← 추가!
+        + list(m.kp_token_enc.parameters())
+        + list(m.cnn_token_enc.parameters())
+        + (list(angle_loss.vm.parameters()) if hasattr(angle_loss, "vm") else [])
     )
 
-    # kpt 경로는 기존 그대로 (필요시만 수정)
+    # kpt 경로
     params_kpt = (
         list(m.cnn_stem.parameters())
         + params_shared
@@ -528,13 +559,27 @@ def setup(hyperparameters, dataset_groups, rank, world_size):
         'kpt': torch.optim.AdamW(params_kpt, lr=hyperparameters['lr_kpt']),
         'ang': torch.optim.AdamW(params_ang, lr=hyperparameters['lr_ang'])
     }
+
+    # 🔥 Warmup(5) + Cosine
+    from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, LinearLR
+    warmup_epochs = 5
+    total_epochs = hyperparameters['num_epochs']
+    assert total_epochs > warmup_epochs, "num_epochs는 warmup_epochs보다 커야 합니다."
+
+    warm_kpt = LinearLR(optimizers['kpt'], start_factor=0.2, total_iters=warmup_epochs)
+    warm_ang = LinearLR(optimizers['ang'], start_factor=0.2, total_iters=warmup_epochs)
+
+    cosine_kpt = CosineAnnealingLR(optimizers['kpt'], T_max=total_epochs - warmup_epochs)
+    cosine_ang = CosineAnnealingLR(optimizers['ang'], T_max=total_epochs - warmup_epochs)
+
     schedulers = {
-        'kpt': CosineAnnealingLR(optimizers['kpt'], T_max=hyperparameters['num_epochs']),
-        'ang': CosineAnnealingLR(optimizers['ang'], T_max=hyperparameters['num_epochs'])
+        'kpt': SequentialLR(optimizers['kpt'], schedulers=[warm_kpt, cosine_kpt], milestones=[warmup_epochs]),
+        'ang': SequentialLR(optimizers['ang'], schedulers=[warm_ang, cosine_ang], milestones=[warmup_epochs]),
     }
 
     if rank == 0:
         print(f"Dataset split: {len(train_dataset)} train, {len(val_dataset)} val.")
+        print(f"Warmup epochs: {warmup_epochs}")
 
     param_sets = {
         'kpt': set(id(p) for p in params_kpt),
@@ -626,13 +671,13 @@ def main():
     # ---------- 하이퍼파라미터 & 파일 경로 ----------
     hyperparameters = {
         'model_name': MODEL_NAME,
-        'batch_size': 32,
-        'num_epochs': 100,
-        'val_split': 0.1,
-        'loss_weight_kpt': 1.0,
-        'lr_kpt': 1e-4,
-        'lr_ang': 1e-4,
-        'lambda_fk': 0.1,   # << 추가: FK 보조 손실 가중치
+        'batch_size': 72,
+        'num_epochs': 300,
+        'val_split': 0.05,
+        'loss_weight_kpt': 100.0,  # ② 도입 후 20~50 스윕 권장
+        'lr_kpt': 1e-5,
+        'lr_ang': 1e-5,
+        'lambda_fk': 0.5,   # FK 보조 손실 가중치
     }
 
     RESULTS_DIR      = os.path.join(_CUR_DIR, "results_ddp")
@@ -652,7 +697,6 @@ def main():
     # ---------- 시각화용 processor ----------
     if rank == 0:
         print("Loading DINOv3 Processor for transformation config...")
-    # 시각화용 transform
     dino_mean = [0.485, 0.456, 0.406]
     dino_std  = [0.229, 0.224, 0.225]
     resize_size = 224
@@ -675,63 +719,16 @@ def main():
         hyperparameters, dataset_groups, rank, world_size
     )
 
-    # # ============================
-    # # Sanity Check: 1-batch I/O log (rank0 only)
-    # # ============================
-    # if rank == 0:
-    #     print("\n[Sanity Check] One batch structure & model I/O")
-    #     try:
-    #         # 드물게 collate가 None-batch를 만들 수 있으므로 몇 번 시도
-    #         max_try = 5
-    #         batch = None
-    #         it = iter(train_loader)
-    #         for _ in range(max_try):
-    #             tmp = next(it)
-    #             if tmp[0] is not None:  # image_dict가 None 아니면 OK
-    #                 batch = tmp
-    #                 break
-
-    #         if batch is None:
-    #             print("  -> Could not fetch a valid batch for sanity check (will skip).")
-    #         else:
-    #             image_dict, heatmap_dict, angles = batch
-
-    #             # 입력 구조 프린트
-    #             print("  [Input]")
-    #             print(f"    - batch_size (angles): {angles.shape[0]}")
-    #             print(f"    - angles shape: {tuple(angles.shape)}  # (B, NUM_ANGLES)")
-    #             print(f"    - num_views in this batch: {len(image_dict)}")
-    #             for k in sorted(image_dict.keys()):
-    #                 t = image_dict[k]
-    #                 print(f"      • images['{k}']: shape={tuple(t.shape)}, dtype={t.dtype}, device={t.device}")
-    #             for k in sorted(heatmap_dict.keys()):
-    #                 t = heatmap_dict[k]
-    #                 print(f"      • heatmaps['{k}']: shape={tuple(t.shape)}, dtype={t.dtype}, device={t.device}")
-
-    #             # 모델 I/O 프린트
-    #             with torch.no_grad():
-    #                 # 장치로 이동
-    #                 images_gpu = {k: v.to(device, non_blocking=True) for k, v in image_dict.items()}
-    #                 pred_heatmaps, pred_angles = model(images_gpu)  # pred_angles: (B, NUM_ANGLES, 2)
-
-    #             print("  [Output]")
-    #             print(f"    - pred_angles: shape={tuple(pred_angles.shape)}  # (B, NUM_ANGLES, 2) -> (sin, cos)")
-    #             print(f"    - pred_heatmaps views: {len(pred_heatmaps)}")
-    #             for k in sorted(pred_heatmaps.keys()):
-    #                 t = pred_heatmaps[k]
-    #                 print(f"      • pred_heatmaps['{k}']: shape={tuple(t.shape)}  # (B, NUM_JOINTS, H, W)")
-
-    #             # 디바이스 메모리 정리(안전)
-    #             del images_gpu, pred_heatmaps, pred_angles
-    #             if torch.cuda.is_available():
-    #                 torch.cuda.empty_cache()
-
-    #     except Exception as e:
-    #         print(f"  -> Sanity check failed but training will continue. Error: {e}")
-
     global results_dir
     results_dir = RESULTS_DIR
 
+        # ---------- AMP Grad Scaler ----------
+    scalers = {
+        'kpt': torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available()),
+        'ang': torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available()),
+    }
+
+    
     # ---------- wandb ----------
     if rank == 0:
         run = wandb.init(project="multiview-fr5-ddp-final", config=hyperparameters,
@@ -778,12 +775,27 @@ def main():
             print("ℹ️ No fine-tune weights found; training from scratch configuration.")
 
     # ---------- 학습 루프 ----------
+        # ---------- 학습 루프 ----------
     if rank == 0:
         print("\n--- Starting Training ---")
-    switch_epoch = hyperparameters['num_epochs'] // 2  # 절반 시점
+    switch_epoch = hyperparameters['num_epochs'] // 3
+
+    # SoftArgmax β, CNN token dropout 스케줄 파라미터
+    beta0, beta1 = 1.0, 3.0           # soft-argmax 온도: 초반 부드럽게 → 후반 샤프하게
+    base_token_drop = 0.10            # 초기 토큰 드롭 비율(에폭이 지날수록 감소)
 
     for epoch in range(start_epoch, hyperparameters['num_epochs']):
-        # 절반 에폭부터 강한 증강으로 전환
+        # --- 스케줄 값 계산 ---
+        progress = epoch / max(1, hyperparameters['num_epochs'] - 1)
+        m = model.module if hasattr(model, "module") else model
+
+        # 8) SoftArgmax β 스케줄링
+        m.softarg.beta = float(beta0 + (beta1 - beta0) * progress)
+
+        # 8) CNN 토큰 드롭아웃 스케줄링 (forward에서 drop_prob_scheduled 사용)
+        m.drop_prob_scheduled = max(0.0, base_token_drop * (1.0 - progress))
+
+        # 증강 전환(강증강)
         if epoch == switch_epoch:
             if rank == 0:
                 print(f"[Augment] Switching to strong augmentation at epoch {epoch}.")
@@ -791,21 +803,26 @@ def main():
 
         train_sampler.set_epoch(epoch)
 
+        # === 한 에폭 학습 ===
         train_loss_kpt, train_loss_ang = train_one_epoch(
             model, train_loader, optimizers, criteria, device,
-            hyperparameters['loss_weight_kpt'], epoch + 1, param_sets
+            hyperparameters['loss_weight_kpt'], epoch + 1, param_sets, scalers
         )
 
+        # === 검증 ===
         (val_loss, val_kpt, val_ang,
          val_ang_mae, val_kpt_px) = validate(
             model, val_loader, criteria, device,
-            hyperparameters['loss_weight_kpt'], epoch + 1
+            hyperparameters['loss_weight_kpt'], epoch + 1,
+            amp_enabled=torch.cuda.is_available()
         )
 
+        # 스케줄러 스텝
         schedulers['kpt'].step(); schedulers['ang'].step()
 
+        # --- rank==0 로깅/저장 ---
         if rank == 0:
-            wandb.log({
+            log_dict = {
                 "epoch": epoch + 1,
                 "train_loss_kpt": train_loss_kpt,
                 "train_loss_ang": train_loss_ang,
@@ -816,7 +833,19 @@ def main():
                 "val_kpt_L2px_128": val_kpt_px,
                 "lr_kpt": optimizers['kpt'].param_groups[0]['lr'],
                 "lr_ang": optimizers['ang'].param_groups[0]['lr'],
-            })
+                # 8) 모니터링: 현재 softarg β / token drop
+                "softarg_beta": m.softarg.beta,
+                "cnn_token_drop_sched": m.drop_prob_scheduled,
+            }
+            # 7) (선택) von Mises κ 로깅
+            if hasattr(criteria['ang'], 'vm'):
+                with torch.no_grad():
+                    kappa = criteria['ang'].vm.log_kappa.exp().detach().cpu().numpy()
+                # joint별로 너무 많으면 평균만 기록
+                log_dict["kappa_mean"] = float(kappa.mean())
+
+            if run is not None:
+                wandb.log(log_dict)
 
             lr_kpt = optimizers['kpt'].param_groups[0]['lr']
             lr_ang = optimizers['ang'].param_groups[0]['lr']
@@ -824,12 +853,16 @@ def main():
                 f"Epoch {epoch+1} -> "
                 f"Val Total: {val_loss:.6f} | ValKPT: {val_kpt:.6f} | ValANG: {val_ang:.6f} | "
                 f"MAE(deg): {val_ang_mae:.3f} | KPT_L2px(128): {val_kpt_px:.2f} | "
-                f"LR_kpt: {lr_kpt:.6f} | LR_ang: {lr_ang:.6f}"
+                f"LR_kpt: {lr_kpt:.6f} | LR_ang: {lr_ang:.6f} | "
+                f"beta: {m.softarg.beta:.2f} | drop: {m.drop_prob_scheduled:.3f}"
             )
 
-            # DDP에서 저장은 module 기준이 깔끔
+            # -------------------------------
+            # ✅ 모델 저장(베스트) + 시각화
+            # -------------------------------
             state_to_save = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
 
+            did_best_visualize = False
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 print(f"🎉 New best model saved with validation loss: {best_val_loss:.6f}")
@@ -839,11 +872,29 @@ def main():
                     model, val_loader.dataset, device, mean, std,
                     epoch + 1, results_dir=RESULTS_DIR, num_samples=1
                 )
-                wandb.log({"validation_predictions": [wandb.Image(fig) for fig in figs]})
+                if run is not None:
+                    wandb.log({"validation_predictions": [wandb.Image(fig) for fig in figs]})
+                for fig in figs:
+                    import matplotlib.pyplot as plt
+                    plt.close(fig)
+                did_best_visualize = True
+
+            # --------------------------------------------------------
+            # 🆕 매 5 에폭마다 시각화 저장 (베스트가 아니어도 강제 저장)
+            # --------------------------------------------------------
+            if ((epoch + 1) % 5 == 0) and (not did_best_visualize):
+                print(f"🖼️ Periodic visualization at epoch {epoch+1} (every 5 epochs).")
+                figs = visualize_predictions(
+                    model, val_loader.dataset, device, mean, std,
+                    epoch + 1, results_dir=RESULTS_DIR, num_samples=1
+                )
+                if run is not None:
+                    wandb.log({f"periodic_predictions/epoch_{epoch+1}": [wandb.Image(fig) for fig in figs]})
                 for fig in figs:
                     import matplotlib.pyplot as plt
                     plt.close(fig)
 
+            # 체크포인트 저장(항상)
             checkpoint = {
                 'epoch': epoch + 1,
                 'model_state_dict': state_to_save,
@@ -854,7 +905,6 @@ def main():
                 'best_val_loss': best_val_loss,
             }
             torch.save(checkpoint, CHECKPOINT_PATH)
-
     cleanup_ddp()
 
     if rank == 0:

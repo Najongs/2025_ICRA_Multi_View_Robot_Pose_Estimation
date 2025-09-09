@@ -9,6 +9,64 @@ from fr5_utils import (
     MODEL_NAME, NUM_ANGLES, NUM_JOINTS, HEATMAP_SIZE, FEATURE_DIM
 )
 
+# ====== Angle Losses: von Mises NLL + cosine distance ======
+class VonMisesAngleLoss(nn.Module):
+    """
+    pred_vec: (B,A,2) 단위벡터(sin,cos)
+    gt_deg:   (B,A)   각도(도)
+    learnable kappa(조인트별)로 원형 분포 우도 최대화 학습.
+    """
+    def __init__(self, num_angles, learn_kappa=True, init_kappa=2.0):
+        super().__init__()
+        init = torch.ones(num_angles) * init_kappa
+        if learn_kappa:
+            self.log_kappa = nn.Parameter(init.log())
+        else:
+            self.register_buffer("log_kappa", init.log())
+
+    def forward(self, pred_vec, gt_deg):
+        gt_rad = gt_deg * math.pi / 180.0
+        gt_vec = torch.stack([torch.sin(gt_rad), torch.cos(gt_rad)], dim=-1)  # (B,A,2)
+        cos_delta = (pred_vec * gt_vec).sum(dim=-1).clamp(-1+1e-6, 1-1e-6)   # (B,A)
+        kappa = self.log_kappa.exp().view(1, -1)                              # (1,A)
+        nll = -(kappa * cos_delta)                                           # 상수항 제외
+        return nll.mean()
+
+class CosineAngleLoss(nn.Module):
+    """단순 코사인 거리: 1 - cos(Δθ)"""
+    def forward(self, pred_vec, gt_deg):
+        gt_rad = gt_deg * math.pi / 180.0
+        gt_vec = torch.stack([torch.sin(gt_rad), torch.cos(gt_rad)], dim=-1)
+        cos_delta = (pred_vec * gt_vec).sum(dim=-1).clamp(-1+1e-6, 1-1e-6)
+        return (1.0 - cos_delta).mean()
+
+def make_angle_loss(num_angles, vm_weight=0.5, cos_weight=0.5):
+    vm = VonMisesAngleLoss(num_angles, learn_kappa=True, init_kappa=2.0)
+    cos = CosineAngleLoss()
+    def _loss(pred_vec, gt_deg):
+        return vm_weight * vm(pred_vec, gt_deg) + cos_weight * cos(pred_vec, gt_deg)
+    # 두 모듈을 속성으로 보관(DDP에서 파라미터 노출 위해)
+    _loss.vm = vm
+    _loss.cos = cos
+    return _loss
+
+
+def weighed_kpt_loss(pred_hm_dict, heatmaps_gpu, softarg_module):
+    losses = []
+    for k, pred in pred_hm_dict.items():
+        gt = heatmaps_gpu[k]
+        # 기본 픽셀 손실
+        base = F.mse_loss(pred, gt, reduction='none')  # (B,J,H,W)
+        # 엔트로피 기반 joint 가중치
+        with torch.no_grad():
+            ex, ey, ent = softarg_module(pred.detach())   # (B,J)
+            # 낮은 entropy -> 높은 weight. normalize
+            w = (1.0 - ent / (math.log(pred.shape[-1]*pred.shape[-2]) + 1e-6)).clamp(0.1, 1.0)  # (B,J)
+            w = w.unsqueeze(-1).unsqueeze(-1)             # (B,J,1,1)
+        loss = (base * w).mean()
+        losses.append(loss)
+    return torch.stack(losses).mean()
+
 # ==== Torch FK (Modified DH, differentiable) ====
 class FR5FK(nn.Module):
     def __init__(self, device):
