@@ -369,23 +369,21 @@ def setup(hyperparameters, dataset_groups, rank, world_size):
     print(f"--- [Rank {rank}] Setting up environment ---")
     device = torch.device(f'cuda:{rank}')
 
-    # Processor → mean/std, resize/crop
-    processor = AutoImageProcessor.from_pretrained(hyperparameters['model_name'])
-    mean, std = processor.image_mean, processor.image_std
-    resize_size, crop_size = 224, 224
+    # DINO 계열 표준(ImageNet) 정규화 직접 지정
+    mean = [0.485, 0.456, 0.406]
+    std  = [0.229, 0.224, 0.225]
+    resize_size = 224  # 현재 파이프라인은 resize-only
 
     def build_base_transform(mean, std, resize_size=224, crop_size=224):
         return transforms.Compose([
-            transforms.Resize(resize_size),
-            # transforms.CenterCrop(crop_size),
+            transforms.Resize((resize_size, resize_size)),  # 224x224로 강제 워핑
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ])
 
     def build_strong_transform(mean, std, resize_size=224, crop_size=224):
         return transforms.Compose([
-            transforms.Resize(resize_size),
-            # transforms.CenterCrop(crop_size),
+            transforms.Resize((resize_size, resize_size)),  # crop 제거
             transforms.ColorJitter(brightness=0.2, contrast=0.15, saturation=0.15, hue=0.05),
             transforms.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 2.0)),
             transforms.RandomGrayscale(p=0.1),
@@ -394,8 +392,8 @@ def setup(hyperparameters, dataset_groups, rank, world_size):
             transforms.Normalize(mean=mean, std=std),
         ])
 
-    base_transform   = build_base_transform(mean, std, resize_size, crop_size)
-    strong_transform = build_strong_transform(mean, std, resize_size, crop_size)
+    base_transform   = build_base_transform(mean, std, resize_size)
+    strong_transform = build_strong_transform(mean, std, resize_size)
 
     torch.manual_seed(42)
     indices = torch.randperm(len(dataset_groups)).tolist()
@@ -654,20 +652,13 @@ def main():
     # ---------- 시각화용 processor ----------
     if rank == 0:
         print("Loading DINOv3 Processor for transformation config...")
-    processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-    dino_mean = processor.image_mean
-    dino_std = processor.image_std
-    try:
-        crop_size = processor.crop_size['height']
-        resize_size = processor.size['shortest_edge']
-    except (TypeError, KeyError):
-        if rank == 0:
-            print(f"Resized the image to 224x224")
-        resize_size = crop_size = 224
+    # 시각화용 transform
+    dino_mean = [0.485, 0.456, 0.406]
+    dino_std  = [0.229, 0.224, 0.225]
+    resize_size = 224
 
     vis_transform = transforms.Compose([
-        transforms.Resize(resize_size),
-        # transforms.CenterCrop(crop_size),
+        transforms.Resize((resize_size, resize_size)),  # crop 금지
         transforms.ToTensor(),
         transforms.Normalize(mean=dino_mean, std=dino_std),
     ])
