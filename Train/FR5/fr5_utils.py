@@ -10,7 +10,7 @@ NUM_ANGLES = 6
 NUM_JOINTS = 7
 FEATURE_DIM = 768
 HEATMAP_SIZE = (128, 128)
-MAX_VIEWS_PER_GROUP = 2
+MAX_VIEWS_PER_GROUP = 8
 
 # ===== GT heatmap =====
 def create_gt_heatmap(keypoint_2d, HEATMAP_SIZE, sigma):

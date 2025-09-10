@@ -1,4 +1,4 @@
-# model.py
+# fr5_models.py
 import math
 import torch
 import torch.nn as nn
@@ -9,101 +9,8 @@ from fr5_utils import (
     MODEL_NAME, NUM_ANGLES, NUM_JOINTS, HEATMAP_SIZE, FEATURE_DIM
 )
 
-# ====== Angle Losses: von Mises NLL + cosine distance ======
-class VonMisesAngleLoss(nn.Module):
-    """
-    pred_vec: (B,A,2) 단위벡터(sin,cos)
-    gt_deg:   (B,A)   각도(도)
-    learnable kappa(조인트별)로 원형 분포 우도 최대화 학습.
-    """
-    def __init__(self, num_angles, learn_kappa=True, init_kappa=2.0):
-        super().__init__()
-        init = torch.ones(num_angles) * init_kappa
-        if learn_kappa:
-            self.log_kappa = nn.Parameter(init.log())
-        else:
-            self.register_buffer("log_kappa", init.log())
-
-    def forward(self, pred_vec, gt_deg):
-        gt_rad = gt_deg * math.pi / 180.0
-        gt_vec = torch.stack([torch.sin(gt_rad), torch.cos(gt_rad)], dim=-1)  # (B,A,2)
-        cos_delta = (pred_vec * gt_vec).sum(dim=-1).clamp(-1+1e-6, 1-1e-6)   # (B,A)
-        kappa = self.log_kappa.exp().view(1, -1)                              # (1,A)
-        nll = -(kappa * cos_delta)                                           # 상수항 제외
-        return nll.mean()
-
-class CosineAngleLoss(nn.Module):
-    """단순 코사인 거리: 1 - cos(Δθ)"""
-    def forward(self, pred_vec, gt_deg):
-        gt_rad = gt_deg * math.pi / 180.0
-        gt_vec = torch.stack([torch.sin(gt_rad), torch.cos(gt_rad)], dim=-1)
-        cos_delta = (pred_vec * gt_vec).sum(dim=-1).clamp(-1+1e-6, 1-1e-6)
-        return (1.0 - cos_delta).mean()
-
-def make_angle_loss(num_angles, vm_weight=0.5, cos_weight=0.5):
-    vm = VonMisesAngleLoss(num_angles, learn_kappa=True, init_kappa=2.0)
-    cos = CosineAngleLoss()
-    def _loss(pred_vec, gt_deg):
-        return vm_weight * vm(pred_vec, gt_deg) + cos_weight * cos(pred_vec, gt_deg)
-    # 두 모듈을 속성으로 보관(DDP에서 파라미터 노출 위해)
-    _loss.vm = vm
-    _loss.cos = cos
-    return _loss
-
-
-def weighed_kpt_loss(pred_hm_dict, heatmaps_gpu, softarg_module):
-    losses = []
-    for k, pred in pred_hm_dict.items():
-        gt = heatmaps_gpu[k]
-        # 기본 픽셀 손실
-        base = F.mse_loss(pred, gt, reduction='none')  # (B,J,H,W)
-        # 엔트로피 기반 joint 가중치
-        with torch.no_grad():
-            ex, ey, ent = softarg_module(pred.detach())   # (B,J)
-            # 낮은 entropy -> 높은 weight. normalize
-            w = (1.0 - ent / (math.log(pred.shape[-1]*pred.shape[-2]) + 1e-6)).clamp(0.1, 1.0)  # (B,J)
-            w = w.unsqueeze(-1).unsqueeze(-1)             # (B,J,1,1)
-        loss = (base * w).mean()
-        losses.append(loss)
-    return torch.stack(losses).mean()
-
-# ==== Torch FK (Modified DH, differentiable) ====
-class FR5FK(nn.Module):
-    def __init__(self, device):
-        super().__init__()
-        # FR5 DH (deg, m) – fr5_utils에 쓰신 것과 동일 구조
-        a     = torch.tensor([ 0.000, -0.425, -0.395, 0.000, 0.000, 0.000], device=device)
-        d     = torch.tensor([ 0.152,  0.000,  0.000, 0.102, 0.102, 0.100], device=device)
-        alpha = torch.tensor([90.0,    0.0,    0.0,  90.0, -90.0,  0.0],    device=device)
-        self.register_buffer('a', a); self.register_buffer('d', d); self.register_buffer('alpha', alpha)
-
-    @staticmethod
-    def _dh(a, d, alpha_deg, theta_deg):  # broadcast [B]
-        alpha = torch.deg2rad(alpha_deg); th = torch.deg2rad(theta_deg)
-        ca, sa = torch.cos(alpha), torch.sin(alpha)
-        ct, st = torch.cos(th),    torch.sin(th)
-        zeros = torch.zeros_like(ct); ones = torch.ones_like(ct)
-        row0 = torch.stack([ct, -st*ca,  st*sa, a*ct], dim=-1)
-        row1 = torch.stack([st,  ct*ca, -ct*sa, a*st], dim=-1)
-        row2 = torch.stack([0*ct,  sa,     ca,     d], dim=-1)
-        row3 = torch.stack([zeros, zeros, zeros, ones], dim=-1)
-        return torch.stack([row0, row1, row2, row3], dim=-2)
-
-    def forward(self, joint_deg):  # [B,6] or [B,>=6]
-        B = joint_deg.shape[0]
-        theta = joint_deg[..., :6]                # 안전
-        T = torch.eye(4, device=joint_deg.device).unsqueeze(0).repeat(B,1,1)
-        base = T[..., :3, 3]
-        pts = [base]                              # J0
-
-        for i in range(6):
-            Ti = self._dh(self.a[i].expand(B), self.d[i].expand(B), self.alpha[i].expand(B), theta[:, i])
-            T = T @ Ti
-            pts.append(T[..., :3, 3])
-        return torch.stack(pts, dim=1)            # [B, 7, 3]
-
 # -----------------------------
-# Backbone
+# Backbone & Fusion Modules
 # -----------------------------
 class DINOv3Backbone(nn.Module):
     def __init__(self, model_name=MODEL_NAME):
@@ -111,88 +18,42 @@ class DINOv3Backbone(nn.Module):
         self.model = AutoModel.from_pretrained(model_name)
 
     def forward(self, image_tensor_batch):
+        # ▼▼▼ [핵심 수정] with torch.no_grad()를 다시 추가하여 백본을 동결합니다. ▼▼▼
         with torch.no_grad():
             outputs = self.model(pixel_values=image_tensor_batch)
+        
         tokens = outputs.last_hidden_state
         num_reg = int(getattr(self.model.config, "num_register_tokens", 0))
         if not hasattr(self, "_logged_reg"):
             print(f"[DINOv3Backbone] num_register_tokens = {num_reg}, total tokens = {tokens.shape[1]}")
             self._logged_reg = True
-        # CLS + REG 제외 → 패치 토큰만
-        patch_tokens = tokens[:, 1 + num_reg :, :]   # (B, N_patches, D)
+        
+        patch_tokens = tokens[:, 1 + num_reg :, :]  # (B, N_patches, D)
         return patch_tokens
 
-# -----------------------------
-# Multi-View Fusion (token-level)
-# -----------------------------
 class MultiViewFusion(nn.Module):
     def __init__(self, feature_dim=FEATURE_DIM, num_heads=8, dropout=0.1, num_queries=16, num_layers=2):
         super().__init__()
         self.global_queries = nn.Parameter(torch.randn(1, num_queries, feature_dim))
-        layer = nn.TransformerDecoderLayer(
-            d_model=feature_dim, nhead=num_heads, dim_feedforward=feature_dim*4,
-            dropout=dropout, activation='gelu', batch_first=True
-        )
+        layer = nn.TransformerDecoderLayer(d_model=feature_dim, nhead=num_heads, dim_feedforward=feature_dim*4, dropout=dropout, activation='gelu', batch_first=True)
         self.decoder = nn.TransformerDecoder(layer, num_layers=num_layers)
-
     def forward(self, view_features_list):
-        if len(view_features_list) == 0:
-            raise ValueError("MultiViewFusion: empty view feature list")
-        memory = torch.cat(view_features_list, dim=1)      # (B, sum(Np_i), D)
+        if not view_features_list: raise ValueError("MultiViewFusion: empty view feature list")
+        memory = torch.cat(view_features_list, dim=1)
         b = memory.size(0)
-        queries = self.global_queries.repeat(b, 1, 1)      # (B, Q, D)
-        return self.decoder(tgt=queries, memory=memory)     # (B, Q, D)
+        queries = self.global_queries.repeat(b, 1, 1)
+        return self.decoder(tgt=queries, memory=memory)
 
 # -----------------------------
-# Heads (Keypoint)
+# Keypoint Head Modules
 # -----------------------------
 class LightCNNStem(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv_block1 = nn.Sequential(
-            nn.Conv2d(3, 16, 3, 2, 1, bias=False), nn.BatchNorm2d(16), nn.GELU(),
-            nn.Conv2d(16, 32, 3, 2, 1, bias=False), nn.BatchNorm2d(32), nn.GELU()
-        )
-        self.conv_block2 = nn.Sequential(
-            nn.Conv2d(32, 64, 3, 2, 1, bias=False), nn.BatchNorm2d(64), nn.GELU()
-        )
-
+        self.conv_block1 = nn.Sequential(nn.Conv2d(3, 16, 3, 2, 1, bias=False), nn.BatchNorm2d(16), nn.GELU(), nn.Conv2d(16, 32, 3, 2, 1, bias=False), nn.BatchNorm2d(32), nn.GELU())
+        self.conv_block2 = nn.Sequential(nn.Conv2d(32, 64, 3, 2, 1, bias=False), nn.BatchNorm2d(64), nn.GELU())
     def forward(self, x):
-        f4 = self.conv_block1(x)  # 1/4
-        f8 = self.conv_block2(f4) # 1/8
-        return f4, f8
-
-class TokenFuser(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.proj = nn.Conv2d(in_channels, out_channels, 1)
-        self.refine = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False), nn.BatchNorm2d(out_channels), nn.GELU(),
-            nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False), nn.BatchNorm2d(out_channels)
-        )
-        self.residual = nn.Conv2d(in_channels, out_channels, 1)
-
-    def forward(self, x):
-        y = self.proj(x)
-        y = self.refine(y) + self.residual(x)
-        return F.gelu(y)
-
-class FusedUpsampleBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels):
-        super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.refine = nn.Sequential(
-            nn.Conv2d(in_channels+skip_channels, out_channels, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(out_channels), nn.GELU(),
-            nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(out_channels), nn.GELU()
-        )
-
-    def forward(self, x, skip):
-        x = self.up(x)
-        if x.shape[-2:] != skip.shape[-2:]:
-            skip = F.interpolate(skip, size=x.shape[-2:], mode='bilinear', align_corners=False)
-        return self.refine(torch.cat([x, skip], dim=1))
+        return self.conv_block1(x), self.conv_block2(self.conv_block1(x))
 
 class UNetViTKeypointHead(nn.Module):
     def __init__(self, input_dim=FEATURE_DIM, num_joints=NUM_JOINTS, heatmap_size=(128, 128)):
@@ -203,22 +64,43 @@ class UNetViTKeypointHead(nn.Module):
         self.dec2 = FusedUpsampleBlock(128, 32, 64)
         self.up_final = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.pred = nn.Conv2d(64, num_joints, 3, 1, 1)
-
     def forward(self, dino_features, cnn_features):
         f4, f8 = cnn_features
         b, n, d = dino_features.shape
         h = w = int(n ** 0.5)
-        assert h * w == n, f"[UNetViTKeypointHead] patch tokens must form a square grid, got n={n}."
         x = dino_features.permute(0, 2, 1).reshape(b, d, h, w)
         x = self.token_fuser(x)
         x = self.dec1(x, f8)
         x = self.dec2(x, f4)
         x = self.up_final(x)
-        heat = self.pred(x)  # (B,J,h,w) upsampled to near input stride
+        heat = self.pred(x)
         return F.interpolate(heat, size=self.heatmap_size, mode='bilinear', align_corners=False)
 
+# (TokenFuser, FusedUpsampleBlock 정의는 생략 - 변경 없음)
+class TokenFuser(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, out_channels, 1)
+        self.refine = nn.Sequential(nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False), nn.BatchNorm2d(out_channels), nn.GELU(), nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False), nn.BatchNorm2d(out_channels))
+        self.residual = nn.Conv2d(in_channels, out_channels, 1)
+    def forward(self, x):
+        y = self.proj(x)
+        y = self.refine(y) + self.residual(x)
+        return F.gelu(y)
+
+class FusedUpsampleBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.refine = nn.Sequential(nn.Conv2d(in_channels+skip_channels, out_channels, 3, 1, 1, bias=False), nn.BatchNorm2d(out_channels), nn.GELU(), nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False), nn.BatchNorm2d(out_channels), nn.GELU())
+    def forward(self, x, skip):
+        x = self.up(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            skip = F.interpolate(skip, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        return self.refine(torch.cat([x, skip], dim=1))
+
 # -----------------------------
-# Soft-argmax & KP token encoder
+# Tokenizer Modules
 # -----------------------------
 class SoftArgmax2D(nn.Module):
     def __init__(self, H=128, W=128, beta=1.0, eps=1e-6):
@@ -228,266 +110,155 @@ class SoftArgmax2D(nn.Module):
         xs = torch.linspace(0, W-1, W)
         ys = torch.linspace(0, H-1, H)
         grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
-        self.register_buffer('grid_x', grid_x)  # (H,W)
-        self.register_buffer('grid_y', grid_y)  # (H,W)
-
-    def forward(self, heat):  # (B, J, H, W)
+        self.register_buffer('grid_x', grid_x)
+        self.register_buffer('grid_y', grid_y)
+    def forward(self, heat):
         B,J,H,W = heat.shape
-        h = heat.view(B*J, H*W)
-        p = F.softmax(self.beta * h, dim=-1) + self.eps  # (B*J, HW)
-        ex = torch.sum(p * self.grid_x.flatten(), dim=-1)  # (B*J,)
-        ey = torch.sum(p * self.grid_y.flatten(), dim=-1)
-        ex = ex.view(B, J); ey = ey.view(B, J)
-        ent = -torch.sum(p * p.log(), dim=-1).view(B, J)  # (B,J) entropy
+        p = F.softmax(self.beta * heat.view(B*J, H*W), dim=-1) + self.eps
+        ex = torch.sum(p * self.grid_x.flatten(), dim=-1).view(B, J)
+        ey = torch.sum(p * self.grid_y.flatten(), dim=-1).view(B, J)
+        ent = -torch.sum(p * p.log(), dim=-1).view(B, J)
         return ex, ey, ent
 
 class KeypointTokenEncoder(nn.Module):
     def __init__(self, num_views, num_joints, embed_dim, use_uncert=True):
         super().__init__()
         in_dim = 3 if use_uncert else 2
-        self.view_embed  = nn.Embedding(num_views,  embed_dim)
-        self.joint_embed = nn.Embedding(num_joints, embed_dim)   # 추가
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim + embed_dim*2, embed_dim),  # view + joint
-            nn.GELU(), nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, embed_dim)
-        )
-        self.num_joints = num_joints
-
+        self.view_embed  = nn.Embedding(num_views, embed_dim)
+        self.joint_embed = nn.Embedding(num_joints, embed_dim)
+        self.mlp = nn.Sequential(nn.Linear(in_dim + embed_dim*2, embed_dim), nn.GELU(), nn.LayerNorm(embed_dim), nn.Linear(embed_dim, embed_dim))
     def forward(self, xyu_per_view, view_idx_per_view):
         feats = []
         for (feat, vidx) in zip(xyu_per_view, view_idx_per_view):
-            B,J,C = feat.shape
-            ve = self.view_embed.weight[vidx].expand(B, J, -1)             # (B,J,D)
-            je = self.joint_embed.weight.view(1, J, -1).expand(B, J, -1)   # (B,J,D)
-            inp = torch.cat([feat, ve, je], dim=-1)                         # (B,J,C+2D)
+            B,J,_ = feat.shape
+            ve = self.view_embed.weight[vidx].expand(B, J, -1)
+            je = self.joint_embed.weight.unsqueeze(0).expand(B, -1, -1)
+            inp = torch.cat([feat, ve, je], dim=-1)
             feats.append(self.mlp(inp))
-        return torch.cat(feats, dim=1)  # (B, V*J, D)
+        return torch.cat(feats, dim=1)
 
-
-# (model.py 상단 import와 클래스들 사이 적당한 곳에 추가)
 class CNNTokenEncoder(nn.Module):
-    """
-    (f4, f8) CNN feature → 소수의 토큰으로 요약해 D차원으로 투영
-    tokens_per_view = s*s 로 만들고, AdaptiveAvgPool로 s×s 그리드 토큰 생성
-    """
     def __init__(self, in_ch_f4=32, in_ch_f8=64, embed_dim=FEATURE_DIM, tokens_per_view: int = 16):
         super().__init__()
-        self.s = int(tokens_per_view ** 0.5)
-        assert self.s * self.s == tokens_per_view, "tokens_per_view must be a square (e.g., 4, 9, 16, ...)"
-
-        # f8: (B,64,h8,w8) → D
-        self.proj_f8 = nn.Conv2d(in_ch_f8, embed_dim, kernel_size=1, bias=False)
-        # f4: (B,32,h4,w4) → stride-2 다운샘플 → D
-        self.down_f4 = nn.Conv2d(in_ch_f4, in_ch_f4, kernel_size=3, stride=2, padding=1, bias=False)
-        self.proj_f4 = nn.Conv2d(in_ch_f4, embed_dim, kernel_size=1, bias=False)
-
-        self.pool = nn.AdaptiveAvgPool2d((self.s, self.s))
+        s = int(tokens_per_view ** 0.5)
+        self.pool = nn.AdaptiveAvgPool2d((s, s))
+        self.proj_f8 = nn.Conv2d(in_ch_f8, embed_dim, 1, bias=False)
+        self.down_f4 = nn.Conv2d(in_ch_f4, in_ch_f4, 3, 2, 1, bias=False)
+        self.proj_f4 = nn.Conv2d(in_ch_f4, embed_dim, 1, bias=False)
         self.norm = nn.LayerNorm(embed_dim)
-
     def forward(self, f4, f8):
-        # f8 branch
-        t8 = self.proj_f8(f8)                 # (B,D,h8,w8)
-        t8 = self.pool(t8)                    # (B,D,s,s)
-
-        # f4 branch (downsample to f8 scale then project)
-        f4d = self.down_f4(f4)                # (B,32,h8,w8) roughly
-        t4 = self.proj_f4(f4d)                # (B,D,h8,w8)
-        t4 = self.pool(t4)                    # (B,D,s,s)
-
-        t = 0.5 * (t8 + t4)                   # (B,D,s,s)
+        t8 = self.pool(self.proj_f8(f8))
+        t4 = self.pool(self.proj_f4(self.down_f4(f4)))
+        t = (t8 + t4) * 0.5
         B, D, S, _ = t.shape
-        t = t.permute(0,2,3,1).contiguous().view(B, S*S, D)  # (B, tokens_per_view, D)
-        t = self.norm(t)
-        return t
+        t = t.permute(0,2,3,1).contiguous().view(B, S*S, D)
+        return self.norm(t)
 
 # -----------------------------
-# Angle Head (memory-driven)
+# Angle Head
 # -----------------------------
 class JointAngleHead(nn.Module):
-    """
-    외부 memory(=fused + kp_tokens)를 입력 받아 각도(sin,cos) 회귀
-    """
-    def __init__(self, input_dim=FEATURE_DIM, num_angles=NUM_ANGLES,
-                 num_queries=16, nhead=8, num_layers=2):
+    def __init__(self, input_dim=FEATURE_DIM, num_angles=NUM_ANGLES, num_queries=16, nhead=8, num_layers=2):
         super().__init__()
         self.num_angles = num_angles
         self.pose_queries = nn.Parameter(torch.randn(1, num_queries, input_dim))
-        layer = nn.TransformerDecoderLayer(
-            d_model=input_dim, nhead=nhead, dim_feedforward=input_dim*4,
-            dropout=0.1, activation='gelu', batch_first=True
-        )
+        layer = nn.TransformerDecoderLayer(d_model=input_dim, nhead=nhead, dim_feedforward=input_dim*4, dropout=0.1, activation='gelu', batch_first=True)
         self.decoder = nn.TransformerDecoder(layer, num_layers=num_layers)
-        self.mlp = nn.Sequential(
-            nn.LayerNorm(input_dim*num_queries),
-            nn.Linear(input_dim*num_queries, 512), nn.GELU(), nn.LayerNorm(512),
-            nn.Linear(512, 256), nn.GELU(), nn.LayerNorm(256),
-            nn.Linear(256, num_angles * 2)
-        )
-
+        self.mlp = nn.Sequential(nn.LayerNorm(input_dim*num_queries), nn.Linear(input_dim*num_queries, 512), nn.GELU(), nn.LayerNorm(512), nn.Linear(512, 256), nn.GELU(), nn.LayerNorm(256), nn.Linear(256, num_angles * 2))
     def forward(self, memory):
-        """
-        memory: (B, T, D)  ← fused tokens (+ optional kp tokens)
-        returns: (B, A, 2) with unit norm
-        """
         B = memory.size(0)
-        q = self.pose_queries.repeat(B, 1, 1)              # (B,Q,D)
-        attn = self.decoder(tgt=q, memory=memory)          # (B,Q,D)
-        out = self.mlp(attn.flatten(start_dim=1))          # (B, 2*A)
-        out = out.view(B, self.num_angles, 2)
-        out = out / (out.norm(dim=-1, keepdim=True) + 1e-6)
-        return out
+        q = self.pose_queries.repeat(B, 1, 1)
+        attn = self.decoder(tgt=q, memory=memory)
+        out = self.mlp(attn.flatten(start_dim=1)).view(B, self.num_angles, 2)
+        return F.normalize(out, dim=-1)
 
-# -----------------------------
-# Final Model
-# -----------------------------
+# ==============================================================================
+# Final Model (수정된 버전)
+# ==============================================================================
 class DINOv3PoseEstimator(nn.Module):
-    def __init__(self, model_name=MODEL_NAME, num_joints=NUM_JOINTS, num_angles=NUM_ANGLES,
-                 known_view_keys=None, max_views=10):
+    # ▼▼▼ [핵심 수정] __init__에서 known_view_keys 제거, max_views를 기본으로 사용 ▼▼▼
+    def __init__(self, model_name=MODEL_NAME, num_joints=NUM_JOINTS, num_angles=NUM_ANGLES, max_views=10):
         super().__init__()
         self.backbone = DINOv3Backbone(model_name)
         feature_dim = self.backbone.model.config.hidden_size
 
-        # view embedding
-        if known_view_keys is not None:
-            self.known_view_keys = list(known_view_keys)
-            self.view_to_idx = {k: i for i, k in enumerate(self.known_view_keys)}
-            self.view_embeddings = nn.Embedding(len(self.known_view_keys), feature_dim)
-            self.num_known_views = len(self.known_view_keys)
-        else:
-            self.known_view_keys = None
-            self.view_to_idx = {}
-            self.view_embeddings = nn.Embedding(max_views, feature_dim)
-            self.num_known_views = max_views
+        # View Embedding: 더 이상 특정 키에 의존하지 않고, 최대 뷰 개수만 가정합니다.
+        self.max_views = max_views
+        self.view_embeddings = nn.Embedding(self.max_views, feature_dim)
 
         # branches
         self.cnn_stem = LightCNNStem()
         self.fusion   = MultiViewFusion(feature_dim=feature_dim)
         self.kpt_head = UNetViTKeypointHead(input_dim=feature_dim, num_joints=num_joints)
-        self.kpt_enricher = nn.TransformerDecoderLayer(
-            d_model=feature_dim, nhead=8, dim_feedforward=feature_dim*4,
-            dropout=0.1, activation='gelu', batch_first=True
-        )
+        self.kpt_enricher = nn.TransformerDecoderLayer(d_model=feature_dim, nhead=8, dim_feedforward=feature_dim*4, dropout=0.1, activation='gelu', batch_first=True)
         self.ang_head = JointAngleHead(input_dim=feature_dim, num_angles=num_angles)
 
-        # kp → tokens
+        # Tokenizers
         self.softarg = SoftArgmax2D(H=HEATMAP_SIZE[0], W=HEATMAP_SIZE[1], beta=1.0)
         self.kp_token_enc = KeypointTokenEncoder(
-            num_views=self.num_known_views, num_joints=num_joints,
+            num_views=self.max_views, # num_known_views 대신 max_views 사용
+            num_joints=num_joints,
             embed_dim=feature_dim, use_uncert=True
         )
-        # 기존 __init__ 말미에 추가
-        self.cnn_token_enc = CNNTokenEncoder(in_ch_f4=32, in_ch_f8=64,
-                                            embed_dim=feature_dim, tokens_per_view=16)
-        self.detach_cnn = False         # 필요시 True로 켜서 angle 쪽만 먼저 안정화
-        self.cnn_token_dropout = 0.1    # 0.0~0.3 권장 (학습 안정/일반화)
-
-
-        # 처음엔 detach ON 권장 (훈련 루프에서 set_detach_kp(False)로 끔)
-        self.detach_kp = False
-
-    def set_detach_kp(self, flag: bool):
-        self.detach_kp = bool(flag)
+        self.cnn_token_enc = CNNTokenEncoder(embed_dim=feature_dim)
         
-    def set_detach_cnn(self, flag: bool):
-        self.detach_cnn = bool(flag)
+        # 학습 제어용 플래그
+        self.detach_kp = False
+        self.detach_cnn = False
+        self.drop_prob_scheduled = 0.0 # 학습 루프에서 직접 제어
 
+    def set_detach_kp(self, flag: bool): self.detach_kp = bool(flag)
+    def set_detach_cnn(self, flag: bool): self.detach_cnn = bool(flag)
 
+    # ▼▼▼ [핵심 수정] forward에서 입력 딕셔너리의 순서를 이용해 view index를 동적으로 할당 ▼▼▼
     def forward(self, multi_view_images: dict):
-        all_dino = []
-        all_cnn  = {}
-        cnn_token_list = []
-        view_indices = []
-        kept_keys = []                      # ✅ 추가
+        all_dino, all_cnn, cnn_token_list, view_indices = [], {}, [], []
+        
+        ordered_keys = list(multi_view_images.keys())
+        if len(ordered_keys) > self.max_views:
+            ordered_keys = ordered_keys[:self.max_views]
 
-        # 고정된 순서로 순회
-        for k in list(multi_view_images.keys()):
+        for i, k in enumerate(ordered_keys):
             x = multi_view_images[k]
+            dino = self.backbone(x)
 
-            dino = self.backbone(x)         # (B,Np,D)
-
-            # view index 확보
-            if self.known_view_keys is not None:
-                if k not in self.view_to_idx:
-                    continue                 # 스킵되면 아래 전부 미수행
-                idx = self.view_to_idx[k]
-            else:
-                if k not in self.view_to_idx:
-                    cur = len(self.view_to_idx)
-                    if cur >= self.view_embeddings.num_embeddings:
-                        raise ValueError("Exceeded maximum number of views.")
-                    self.view_to_idx[k] = cur
-                idx = self.view_to_idx[k]
-
-            # emb 주입
-            ve = self.view_embeddings.weight[idx].view(1,1,-1)  # 미세 최적화
+            # View Embedding: i번째 뷰로 임베딩 적용
+            ve = self.view_embeddings.weight[i].view(1,1,-1)
             all_dino.append(dino + ve)
-            kept_keys.append(k)               # ✅ 실제로 사용된 키만 기록
-
-            # CNN stem
+            
             f4, f8 = self.cnn_stem(x)
             all_cnn[k] = (f4, f8)
-            view_indices.append(idx)
+            view_indices.append(i)
+            
+            cnn_tokens = self.cnn_token_enc(f4, f8)
+            cnn_token_list.append(cnn_tokens + ve)
 
-            # CNN tokens
-            cnn_tokens = self.cnn_token_enc(f4, f8)  # (B,Tc,D)
-            cnn_tokens = cnn_tokens + self.view_embeddings.weight[idx].view(1,1,-1)
-            cnn_token_list.append(cnn_tokens)
+        if not all_dino: raise ValueError("DINOv3PoseEstimator: no valid views in the batch.")
 
-        if len(all_dino) == 0:
-            raise ValueError("DINOv3PoseEstimator: no valid views in the batch.")
+        fused = self.fusion(all_dino)
 
-        fused = self.fusion(all_dino)        # (B,Q,D)
-
-        # ✅ kept_keys 기준으로 heatmap 생성
-        pred_hm_dict = {}
-        kp_feat_per_view = []
-        for i, k in enumerate(kept_keys):
-            f4, f8 = all_cnn[k]
+        pred_hm_dict, kp_feat_per_view = {}, []
+        for i, k in enumerate(ordered_keys):
             enr = self.kpt_enricher(tgt=all_dino[i], memory=fused)
-            hm  = self.kpt_head(enr, (f4, f8))
+            hm  = self.kpt_head(enr, all_cnn[k])
             pred_hm_dict[k] = hm
 
             ex, ey, ent = self.softarg(hm)
             H, W = hm.shape[-2:]
-            xyu = torch.stack([
-                ex / (W-1 + 1e-6),
-                ey / (H-1 + 1e-6),
-                # 확률 p에 eps 더하면 합=1이 깨집니다. → entropy만 안전하게 계산:
-                # 여기선 기존대로 두되, 아래 선택 수정 참조.
-                ent / (math.log(max(1, H*W)) + 1e-6)
-            ], dim=-1)
+            xyu = torch.stack([ex / (W-1+1e-6), ey / (H-1+1e-6), ent / (math.log(H*W)+1e-6)], dim=-1)
             kp_feat_per_view.append(xyu)
+            
+        kp_tokens = self.kp_token_enc(kp_feat_per_view, view_indices)
+        if self.detach_kp: kp_tokens = kp_tokens.detach()
 
-        # (3) kp tokens
-        if len(kp_feat_per_view) > 0:
-            kp_tokens = self.kp_token_enc(kp_feat_per_view, view_indices)  # (B,V*J,D)
-            if self.detach_kp:
-                kp_tokens = kp_tokens.detach()
-        else:
-            kp_tokens = None
+        cnn_tokens_all = torch.cat(cnn_token_list, dim=1)
+        if self.detach_cnn: cnn_tokens_all = cnn_tokens_all.detach()
+        if self.training and self.drop_prob_scheduled > 0:
+            B, T, D = cnn_tokens_all.shape
+            mask = (torch.rand(B, T, 1, device=cnn_tokens_all.device) > self.drop_prob_scheduled).float()
+            cnn_tokens_all = cnn_tokens_all * mask
 
-        # --- NEW: cnn tokens 결합
-        if len(cnn_token_list) > 0:
-            cnn_tokens_all = torch.cat(cnn_token_list, dim=1)  # (B, V*Tc, D)
-            if self.detach_cnn:
-                cnn_tokens_all = cnn_tokens_all.detach()
-            if self.training and self.cnn_token_dropout > 0:
-                # 간단한 토큰 드롭아웃
-                drop_prob = self.cnn_token_dropout
-                B, T, D = cnn_tokens_all.shape
-                mask = (torch.rand(B, T, 1, device=cnn_tokens_all.device) > drop_prob).float()
-                cnn_tokens_all = cnn_tokens_all * mask
-        else:
-            cnn_tokens_all = None
-
-        # (4) memory 확장: fused (+ kp) (+ cnn)
-        memory_ext = fused
-        if kp_tokens is not None:
-            memory_ext = torch.cat([memory_ext, kp_tokens], dim=1)
-        if cnn_tokens_all is not None:
-            memory_ext = torch.cat([memory_ext, cnn_tokens_all], dim=1)
-
-        # (5) angle head
-        pred_angles = self.ang_head(memory_ext)            # (B,A,2)
+        memory_ext = torch.cat([fused, kp_tokens, cnn_tokens_all], dim=1)
+        pred_angles = self.ang_head(memory_ext)
+        
         return pred_hm_dict, pred_angles
