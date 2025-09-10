@@ -28,8 +28,7 @@ def load_model(model_path, model_name, device):
     state_dict = torch.load(model_path, map_location=device)
     # DataParallel 접두사('module.') 제거
     if next(iter(state_dict)).startswith('module.'):
-        state_dict = {k[7:]: v for k, v in state_dict.items()}
-    
+        state_dict = {k[7:]: v for k, v in state_dict.items()} 
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()

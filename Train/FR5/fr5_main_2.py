@@ -674,16 +674,16 @@ def main():
         'batch_size': 72,
         'num_epochs': 100,
         'val_split': 0.05,
-        'loss_weight_kpt': 1.0,  # ② 도입 후 20~50 스윕 권장
-        'lr_kpt': 1e-6,
-        'lr_ang': 1e-6,
+        'loss_weight_kpt': 1000.0,  # ② 도입 후 20~50 스윕 권장
+        'lr_kpt': 1e-5,
+        'lr_ang': 1e-5,
         'lambda_fk': 0.5,   # FK 보조 손실 가중치
     }
 
     RESULTS_DIR      = os.path.join(_CUR_DIR, "results_ddp")
     CHECKPOINT_PATH  = os.path.join(_CUR_DIR, "multiview_checkpoint_ddp.pth")
     BEST_MODEL_PATH  = os.path.join(_CUR_DIR, "best_multiview_model_ddp.pth")
-    FINETUNE_WEIGHTS = os.path.join(_CUR_DIR, "No2_best_multiview_model_ddp.pth")  # 있으면 사용
+    FINETUNE_WEIGHTS = os.path.join(_CUR_DIR, "No1_best_multiview_model_ddp.pth")  # 있으면 사용
 
     if rank == 0:
         os.makedirs(RESULTS_DIR, exist_ok=True)
