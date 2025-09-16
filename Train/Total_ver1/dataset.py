@@ -13,6 +13,7 @@ from utils import (
     create_gt_heatmap,
     angle_to_joint_coordinate,    # robot='fr3' | 'fr5' | 'meca500'
     project_3d_to_2d_aruco,       # ArUco dict 안전 처리
+    project_3d_to_2d_by_robot,
     perform_grouping,             # ★ 그룹핑 라우팅 (fr3/fr5/meca500)
 )
 
@@ -277,8 +278,14 @@ class UnifiedRobotPoseDataset(Dataset):
         joints_3d = angle_to_joint_coordinate(
             joint_angles, robot=self.robot, selected_view=view, input_unit=self.robot_fk_unit
         )
-        kpts_2d = project_3d_to_2d_aruco(joints_3d, aruco, K_new, dist=None).astype(np.float32)
-
+        kpts_2d = project_3d_to_2d_by_robot(
+            points_3d=joints_3d,          # (J,3)
+            robot=self.robot,             # 'fr5' | 'fr3' | 'meca500'
+            aruco_result=aruco,           # 위에서 선택한 뷰/캠의 아루코 요약
+            K=K_new,                      # undistort로 얻은 새 내참
+            dist=None                     # ✅ undistort 했으니 왜곡은 None
+        ).astype(np.float32)
+        
         # 224×224 워핑
         IN = self.input_size
         resized = cv2.resize(undist, (IN, IN), interpolation=cv2.INTER_LINEAR)

@@ -5,6 +5,7 @@ from transformers import AutoModel
 
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
+from contextlib import nullcontext
 
 @dataclass
 class ModelCfg:
@@ -309,64 +310,95 @@ class DINOv3Backbone(nn.Module):
     def __init__(self, model_name: str, freeze: bool = True, out_dim: Optional[int] = None):
         super().__init__()
         self.model = AutoModel.from_pretrained(model_name)
-        cfg = self.model.config
-        self.hidden_size = int(getattr(cfg, "hidden_size", getattr(cfg, "embed_dim", 768)))
-        self.num_register_tokens = int(getattr(cfg, "num_register_tokens", 0))
-        self.has_cls = bool(getattr(cfg, "add_pooling_token", True)) or (self.num_register_tokens >= 0)
+        self.freeze = freeze
 
-        self.in_dim  = self.hidden_size
-        self.out_dim = out_dim or self.in_dim
-        self.proj_tok = nn.Linear(self.in_dim, self.out_dim, bias=False) if self.out_dim != self.in_dim else None
-        self.proj_map = nn.Conv2d(self.in_dim, self.out_dim, 1, bias=False) if self.out_dim != self.in_dim else None
+        # in/out dim은 ConvNeXt일 경우 config에 명시적이지 않을 수 있으므로 런타임에 확정
+        self.in_dim  = None             # 첫 forward에서 결정
+        self.out_dim = out_dim          # None이면 첫 forward에서 in_dim로 동기화
+        self.proj_tok = None            # 첫 forward에서 필요시 생성
+        self.proj_map = None
 
-        if freeze:
+        if self.freeze:
             for p in self.model.parameters():
                 p.requires_grad = False
             self.model.eval()
 
-    @torch.no_grad()
+    def _flat_views(self, x: torch.Tensor):
+        if x.dim()==5:
+            B,V,C,H,W = x.shape
+            return x.view(B*V, C, H, W), V
+        elif x.dim()==4:
+            return x, None
+        raise ValueError("images must be 4D or 5D")
+
+    def _unflat(self, t: torch.Tensor, V: Optional[int]):
+        if V is None: return t
+        Bv = t.shape[0]; B = Bv//V
+        return t.view(B, V, *t.shape[1:])
+
     def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
-        def flat_views(x):
-            if x.dim()==5:
-                B,V,C,H,W = x.shape
-                return x.view(B*V, C, H, W), V
-            elif x.dim()==4:
-                return x, None
-            raise ValueError("images must be 4D or 5D")
+        import math
 
-        def unflat(t, V):
-            if V is None: return t
-            Bv = t.shape[0]; B = Bv//V
-            return t.view(B, V, *t.shape[1:])
+        x, V = self._flat_views(images)
 
-        x, V = flat_views(images)
-        out = self.model(pixel_values=x)
-        tokens = getattr(out, "last_hidden_state", None)
-        if tokens is None:
+        # 백본 호출만 no_grad (freeze일 때). 이후 프로젝션/reshape 등은 grad 허용.
+        ctx = nullcontext() if not self.freeze else torch.no_grad()
+        with ctx:
+            out = self.model(pixel_values=x)
+        hs = getattr(out, "last_hidden_state", None)
+        if hs is None:
             raise RuntimeError("Backbone output has no last_hidden_state")
 
-        D = tokens.size(-1)
-        R = self.num_register_tokens
-        start = 1 if self.has_cls and tokens.size(1) > 0 else 0
-        start += R
-        patch_tokens = tokens[:, start:, :]   # (B*V, N, D)
-        N = patch_tokens.size(1)
+        # --- 채널(in_dim)과 아웃(out_dim) 확정 & 동적 프로젝션 준비 ---
+        if hs.dim() == 3:
+            # ViT 계열: (B*V, S, Din)
+            Din = hs.size(-1)
+        elif hs.dim() == 4:
+            # ConvNeXt 계열: (B*V, C, Hf, Wf)
+            Din = hs.size(1)
+        else:
+            raise RuntimeError(f"Unexpected backbone output shape: {tuple(hs.shape)}")
 
-        Hf = int(math.sqrt(N))
-        if Hf*Hf != N: Hf, Wf = best_hw_from_N(N)
-        else:          Wf = Hf
+        if self.in_dim is None:
+            self.in_dim = int(Din)
+        if self.out_dim is None:
+            self.out_dim = int(self.in_dim)
 
-        fmap = patch_tokens.permute(0,2,1).reshape(patch_tokens.size(0), D, Hf, Wf).contiguous()
+        need_proj = (self.out_dim != Din)
+        if need_proj and (self.proj_tok is None or self.proj_map is None):
+            # 런타임에 투영 레이어 생성 (학습 가능)
+            self.proj_tok = nn.Linear(Din, self.out_dim, bias=False).to(hs.device)
+            self.proj_map = nn.Conv2d(Din, self.out_dim, 1, bias=False).to(hs.device)
 
-        # projection to out_dim (if requested)
-        if self.proj_tok is not None:
-            patch_tokens = self.proj_tok(patch_tokens)
-        if self.proj_map is not None:
-            fmap = self.proj_map(fmap)
+        # --- ViT 경로 ---
+        if hs.dim() == 3:
+            Bv, S, Din2 = hs.shape
+            # DINOv3 ViT일 때만 CLS/등록토큰 제거
+            num_register_tokens = int(getattr(getattr(self.model, "config", object()), "num_register_tokens", 0))
+            has_cls = bool(getattr(getattr(self.model, "config", object()), "add_pooling_token", True)) or (num_register_tokens >= 0)
+            start = 1 if has_cls and S > 0 else 0
+            start += num_register_tokens
+            patch_tokens = hs[:, start:, :]                               # (B*V, N, Din)
+            N = patch_tokens.size(1)
+            Hf = int(math.sqrt(N)); Wf = Hf if Hf*Hf==N else best_hw_from_N(N)[1]
+
+            fmap = patch_tokens.permute(0,2,1).reshape(Bv, Din, Hf, Wf).contiguous()   # (B*V, Din, Hf, Wf)
+
+        # --- ConvNeXt 경로 ---
+        else:  # hs.dim() == 4
+            Bv, Din2, Hf, Wf = hs.shape
+            fmap = hs                                                        # (B*V, Din, Hf, Wf)
+            patch_tokens = hs.permute(0,2,3,1).reshape(Bv, Hf*Wf, Din).contiguous()    # (B*V, N, Din)
+
+        # --- 프로젝션 적용 (필요시) ---
+        if need_proj and self.proj_tok is not None:
+            patch_tokens = self.proj_tok(patch_tokens)                       # (B*V, N, out_dim)
+        if need_proj and self.proj_map is not None:
+            fmap = self.proj_map(fmap)                                       # (B*V, out_dim, Hf, Wf)
 
         return {
-            "patch_tokens": unflat(patch_tokens, V),   # (B,V,N,out_dim) or (B,N,out_dim)
-            "feature_map":  unflat(fmap, V),           # (B,V,out_dim,Hf,Wf) or (B,out_dim,Hf,Wf)
+            "patch_tokens": self._unflat(patch_tokens, V),   # (B,V,N,out_dim) or (B,N,out_dim)
+            "feature_map":  self._unflat(fmap, V),           # (B,V,out_dim,Hf,Wf) or (B,out_dim,Hf,Wf)
         }
 
 
@@ -401,8 +433,6 @@ class KptHead2D(nn.Module):
         elif feat.dim()==4:  # (B,D,Hf,Wf)
             return self._head_single(feat)
         raise ValueError("feat must be (B,D,H,W) or (B,V,D,H,W)")
-
-
 
 # -------------------------
 # 3) Fusion Adapters (stubs)
@@ -771,7 +801,38 @@ class SoftArgmax2D(nn.Module):
         return coords, conf
 
 class DINOv3PoseEstimator(nn.Module):
-    def __init__(self, cfg: ModelCfg):
+    def __init__(self, cfg: Optional[ModelCfg] = None, **kwargs):
+        """
+        선호: DINOv3PoseEstimator(cfg=ModelCfg(...))
+        호환: DINOv3PoseEstimator(model_id="facebook/...") 또는 model_name=..., num_joints=..., num_angles=...
+        """
+        if cfg is None:
+            # 과거 스타일 허용
+            model_name = kwargs.pop("model_id", kwargs.pop("model_name", MODEL_CNX))
+            num_angles = int(kwargs.pop("num_angles", 6))
+            num_joints = int(kwargs.pop("num_joints", 8))
+            # 나머지 선택 인자들 (없으면 ModelCfg 기본 사용)
+            cfg = ModelCfg(
+                MODEL_NAME=model_name,
+                NUM_ANGLES=num_angles,
+                NUM_JOINTS=num_joints,
+                FEATURE_DIM=kwargs.pop("feature_dim", 768),
+                HEATMAP_SIZE=kwargs.pop("heatmap_size", (128,128)),
+                MAX_VIEWS_PER_GROUP=kwargs.pop("max_views", 8),
+                FUSION=kwargs.pop("fusion", "auto"),
+                DEFAULT_FUSION_FOR_MULTI=kwargs.pop("default_fusion_for_multi", "late"),
+                FREEZE_BACKBONE=kwargs.pop("freeze_backbone", True),
+                MIDDLE_HEADS=kwargs.pop("middle_heads", 4),
+                MIDDLE_DS=kwargs.pop("middle_ds", 2),
+                MIDDLE_LAMBDA_EPI=kwargs.pop("middle_lambda_epi", 0.05),
+                MIDDLE_TEMPERATURE=kwargs.pop("middle_temperature", 1.0),
+                MIDDLE_NUM_VIEW_PROTOTYPES=kwargs.pop("middle_num_view_prototypes", 8),
+                EARLY_REDUCE_DIM=kwargs.pop("early_reduce_dim", None),
+                TOKEN_NUM_QUERIES=kwargs.pop("token_num_queries", 16),
+                TOKEN_NUM_HEADS=kwargs.pop("token_num_heads", 8),
+                TOKEN_NUM_LAYERS=kwargs.pop("token_num_layers", 2),
+                USE_AUTO_VIEW_FOR_TOKENS=kwargs.pop("use_auto_view_for_tokens", True),
+            )
         super().__init__()
         self.cfg = cfg
 

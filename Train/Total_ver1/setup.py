@@ -1,4 +1,4 @@
-# setup.py (또는 학습 스크립트 상단)
+# setup.py
 import itertools
 import torch
 import torch.nn as nn
@@ -8,64 +8,59 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 import torchvision.transforms as transforms
 
-# 통합 Dataset/Utils/Loss
-from dataset import UnifiedRobotPoseDataset          # 앞서 만든 통합본
-from utils import MAX_VIEWS_PER_GROUP                # 필요시 사용
-from loss_and_metrics import make_angle_loss         # 네가 정의한 함수 사용
+from dataset import UnifiedRobotPoseDataset
+from loss_and_metrics import make_angle_loss
+from models import DINOv3PoseEstimator, ModelCfg, MODEL_CNX  # MODEL_CNX는 기본 백본용 상수
 
 # ---------------------------------------------------------
-# 공용 collate: dict-of-views 배치 패딩
+# dict-of-views 배치 패딩 collate
 # ---------------------------------------------------------
 def make_collate_pad_dicts():
     def collate_fn(batch):
-        # (None,None,None) 제거
         batch = [b for b in batch if b[0] is not None]
         if not batch:
             return None, None, None
 
         image_dicts, heatmap_dicts, angles_list = zip(*batch)
-
-        # 배치 내 모든 키 수집
         all_keys = sorted(list(set(itertools.chain.from_iterable(d.keys() for d in image_dicts))))
 
-        # 더미 텐서 준비
-        sample_img_tensor = next(iter(image_dicts[0].values()))
+        sample_img_tensor  = next(iter(image_dicts[0].values()))
         sample_hmap_tensor = next(iter(heatmap_dicts[0].values()))
-        dummy_img = torch.zeros_like(sample_img_tensor)
+        dummy_img  = torch.zeros_like(sample_img_tensor)
         dummy_hmap = torch.zeros_like(sample_hmap_tensor)
 
         padded_images, padded_heatmaps = [], []
         for i in range(len(batch)):
-            padded_img_dict = {k: image_dicts[i].get(k, dummy_img) for k in all_keys}
+            padded_img_dict  = {k: image_dicts[i].get(k,  dummy_img)  for k in all_keys}
             padded_hmap_dict = {k: heatmap_dicts[i].get(k, dummy_hmap) for k in all_keys}
             padded_images.append(padded_img_dict)
             padded_heatmaps.append(padded_hmap_dict)
 
-        images_collated   = torch.utils.data.dataloader.default_collate(padded_images)    # {vk: (B,C,H,W)}
-        heatmaps_collated = torch.utils.data.dataloader.default_collate(padded_heatmaps)  # {vk: (B,J,Hh,Wh)}
+        images_collated   = torch.utils.data.dataloader.default_collate(padded_images)
+        heatmaps_collated = torch.utils.data.dataloader.default_collate(padded_heatmaps)
         angles_collated   = torch.stack(angles_list)
-
         return images_collated, heatmaps_collated, angles_collated
     return collate_fn
 
+
 # ---------------------------------------------------------
-# Experiment Setup (통합 버전)
+# Experiment Setup
 # ---------------------------------------------------------
 def setup(dataset_type,            # 'fr3' | 'fr5' | 'meca500'
-          dataset_items,           # groups or pairs (UnifiedRobotPoseDataset가 바로 받는 포맷)
+          dataset_items,           # groups/pairs
           hyperparameters,
           rank, world_size,
-          model_cls,               # 예: DINOv3PoseEstimator
-          extra_model_kwargs=None  # 필요시 {'model_name': ..., ...}
+          model_cls,               # e.g. DINOv3PoseEstimator
+          extra_model_kwargs=None  # ✅ 기본값 None로 변경 (hparams 참조 금지)
           ):
     print(f"--- [Rank {rank}] Setting up environment for {dataset_type.upper()} ---")
     device = torch.device(f"cuda:{rank}")
 
     mean = [0.485, 0.456, 0.406]
     std  = [0.229, 0.224, 0.225]
-    resize_size = hyperparameters.get("input_size", 224)
+    resize_size  = hyperparameters.get("input_size", 224)
     heatmap_size = hyperparameters.get("heatmap_size", (128,128))
-    sigma = hyperparameters.get("sigma", 5.0)
+    sigma        = hyperparameters.get("sigma", 5.0)
 
     # --------- transforms ----------
     def build_base_transform(mean, std, resize_size=224):
@@ -90,11 +85,10 @@ def setup(dataset_type,            # 'fr3' | 'fr5' | 'meca500'
     # --------- split ----------
     torch.manual_seed(42 + rank)
     idx = torch.randperm(len(dataset_items)).tolist()
-    n_train = int(len(dataset_items) * (1 - hyperparameters['val_split']))
+    n_train     = int(len(dataset_items) * (1 - hyperparameters['val_split']))
     train_items = [dataset_items[i] for i in idx[:n_train]]
     val_items   = [dataset_items[i] for i in idx[n_train:]]
 
-    # 멀티뷰만 2뷰 이상 필터링(싱글뷰 페어는 그대로 유지)
     def _filter(items):
         out = []
         for it in items:
@@ -115,8 +109,8 @@ def setup(dataset_type,            # 'fr3' | 'fr5' | 'meca500'
         heatmap_size=heatmap_size,
         sigma=sigma,
         input_size=resize_size,
-        robot=dataset_type,          # FK 대상 로봇 = 데이터셋 타입
-        robot_fk_unit=None,          # 각 스펙의 기본 단위(rad/deg) 자동 사용
+        robot=dataset_type,
+        robot_fk_unit=None,
     )
     val_dataset = UnifiedRobotPoseDataset(
         dataset_type=dataset_type,
@@ -133,7 +127,6 @@ def setup(dataset_type,            # 'fr3' | 'fr5' | 'meca500'
     val_sampler   = DistributedSampler(val_dataset,   num_replicas=world_size, rank=rank, shuffle=False)
 
     collate_fn = make_collate_pad_dicts()
-
     train_loader = DataLoader(
         train_dataset,
         batch_size=hyperparameters['batch_size'],
@@ -152,11 +145,9 @@ def setup(dataset_type,            # 'fr3' | 'fr5' | 'meca500'
         sampler=val_sampler
     )
 
-    # --------- num_angles 자동 설정 ----------
-    # 1) 로봇 규칙 우선
+    # --------- NUM_ANGLES ----------
     default_angles = {'fr3': 7, 'fr5': 6, 'meca500': 6}
     num_angles = default_angles.get(dataset_type, None)
-    # 2) 데이터에서 확인(안전망)
     if num_angles is None:
         probe = None
         for k in range(min(8, len(train_dataset))):
@@ -169,9 +160,39 @@ def setup(dataset_type,            # 'fr3' | 'fr5' | 'meca500'
             raise RuntimeError("Could not infer NUM_ANGLES from dataset.")
     print(f"[Rank {rank}] NUM_ANGLES = {num_angles}")
 
-    # --------- model ----------
-    extra_model_kwargs = extra_model_kwargs or {}
-    model = model_cls(**extra_model_kwargs).to(device)
+    # --------- ModelCfg (extra_model_kwargs로 override 지원) ----------
+    extra = extra_model_kwargs or {}
+    backbone_name  = extra.get('model_name', MODEL_CNX)
+    feature_dim    = extra.get('feature_dim', hyperparameters.get('feature_dim', 768))
+    fusion_mode    = extra.get('fusion',        "auto")
+    default_fusion = extra.get('default_fusion_for_multi', "late")
+    freeze_bb      = extra.get('freeze_backbone', True)
+    early_reduce   = extra.get('early_reduce_dim', None)
+
+    cfg = ModelCfg(
+        MODEL_NAME=backbone_name,
+        NUM_ANGLES=num_angles,
+        NUM_JOINTS=num_angles+1,
+        FEATURE_DIM=feature_dim,
+        HEATMAP_SIZE=tuple(heatmap_size),
+        MAX_VIEWS_PER_GROUP=8,
+        FUSION=fusion_mode,
+        DEFAULT_FUSION_FOR_MULTI=default_fusion,
+        FREEZE_BACKBONE=freeze_bb,
+        MIDDLE_HEADS=4,
+        MIDDLE_DS=2,
+        MIDDLE_LAMBDA_EPI=0.05,
+        MIDDLE_TEMPERATURE=1.0,
+        MIDDLE_NUM_VIEW_PROTOTYPES=8,
+        EARLY_REDUCE_DIM=early_reduce,
+        TOKEN_NUM_QUERIES=16,
+        TOKEN_NUM_HEADS=8,
+        TOKEN_NUM_LAYERS=2,
+        USE_AUTO_VIEW_FOR_TOKENS=True,
+    )
+    print(f"[Rank {rank}] Using backbone: {cfg.MODEL_NAME}")
+
+    model = DINOv3PoseEstimator(cfg=cfg).to(device)
     model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     # --------- losses / criteria ----------
@@ -179,35 +200,75 @@ def setup(dataset_type,            # 'fr3' | 'fr5' | 'meca500'
     if hasattr(angle_loss, "vm"):
         angle_loss.vm = angle_loss.vm.to(device)
 
-    # (선택) FK regularizer가 있다면 가져오기
     fk_reg = None
     try:
-        from loss_and_metrics import FKRegularizer  # 있다면 쓰기
+        from loss_and_metrics import FKRegularizer
         fk_reg = FKRegularizer(robot=dataset_type, device=device)
     except Exception:
         fk_reg = None
 
     criteria = {'ang': angle_loss}
-    if fk_reg is not None:
-        criteria['fk'] = fk_reg
-        criteria['lambda_fk'] = hyperparameters.get('lambda_fk', 0.5)
-    else:
-        criteria['lambda_fk'] = 0.0
+    criteria['fk'] = fk_reg if fk_reg is not None else None
+    criteria['lambda_fk'] = hyperparameters.get('lambda_fk', 0.5 if fk_reg is not None else 0.0)
 
-    # --------- optimizer / scheduler ----------
-    m = model.module
-    # 안전하게 속성 체크해서 파라미터 모으기
-    def params_of(name):
-        return list(getattr(m, name).parameters()) if hasattr(m, name) else []
+    # --------- Optimizers & param_sets ----------
+    m = model.module if hasattr(model, "module") else model
 
-    params_shared = params_of('view_embeddings') + params_of('fusion')
-    params_ang = params_of('ang_head') + params_shared + params_of('kp_token_enc') + params_of('cnn_token_enc')
-    # angle_loss 내부에 학습가능 파라미터(von-Mises 등)가 있으면 추가
-    if hasattr(angle_loss, "vm"):
-        try: params_ang += list(angle_loss.vm.parameters())
-        except Exception: pass
+    def _params(mod):
+        if mod is None: return []
+        return [p for p in mod.parameters() if p.requires_grad]
 
-    params_kpt = params_of('cnn_stem') + params_shared + params_of('kpt_enricher') + params_of('kpt_head')
+    kpt_modules = [
+        getattr(m.net, "head_per_view", None),
+        getattr(m.net, "head_early", None),
+        getattr(m.net, "middle", None),
+        getattr(m.net, "early_adapter", None),
+    ]
+    ang_modules = [
+        getattr(m, "token_fusion", None),
+        getattr(m, "head_3d", None),
+    ]
+
+    backbone_trainable = []
+    if not cfg.FREEZE_BACKBONE:
+        if getattr(m.net.backbone, "proj_tok", None) is not None:
+            backbone_trainable += _params(m.net.backbone.proj_tok)
+        if getattr(m.net.backbone, "proj_map", None) is not None:
+            backbone_trainable += _params(m.net.backbone.proj_map)
+
+    params_kpt = []
+    for mod in kpt_modules: params_kpt += _params(mod)
+    params_kpt += backbone_trainable
+
+    params_ang = []
+    for mod in ang_modules: params_ang += _params(mod)
+
+    def _uniq(params):
+        seen, out = set(), []
+        for p in params:
+            pid = id(p)
+            if pid not in seen:
+                seen.add(pid); out.append(p)
+        return out
+
+    params_kpt = _uniq(params_kpt)
+    kpt_ids    = set(id(p) for p in params_kpt)
+    params_ang = [p for p in _uniq(params_ang) if id(p) not in kpt_ids]
+
+    all_trainable = [p for p in m.parameters() if p.requires_grad]
+    if len(params_kpt) == 0 and len(params_ang) == 0 and len(all_trainable) > 0:
+        params_kpt = all_trainable
+    if len(params_kpt) == 0 and len(all_trainable) > 0:
+        half = max(1, len(all_trainable)//2)
+        params_kpt = all_trainable[:half]
+        rest = [p for p in all_trainable if id(p) not in set(id(q) for q in params_kpt)]
+        params_ang = rest
+    if len(params_ang) == 0 and len(params_kpt) > 1:
+        cut = max(1, len(params_kpt)//3)
+        params_ang = params_kpt[-cut:]
+        params_kpt = params_kpt[:-cut]
+    elif len(params_ang) == 0 and len(params_kpt) > 0:
+        params_ang = params_kpt[:1]
 
     optimizers = {
         'kpt': torch.optim.AdamW(params_kpt, lr=hyperparameters['lr_kpt']),
@@ -219,26 +280,25 @@ def setup(dataset_type,            # 'fr3' | 'fr5' | 'meca500'
     schedulers = {
         'kpt': SequentialLR(
             optimizers['kpt'],
-            [
-                LinearLR(optimizers['kpt'], start_factor=0.2, end_factor=1.0, total_iters=warmup_epochs),
-                CosineAnnealingLR(optimizers['kpt'], T_max=max(total_epochs - warmup_epochs, 1)),
-            ],
-            milestones=[warmup_epochs]
+            [LinearLR(optimizers['kpt'], start_factor=0.2, end_factor=1.0, total_iters=warmup_epochs),
+             CosineAnnealingLR(optimizers['kpt'], T_max=total_epochs - warmup_epochs)],
+            milestones=[warmup_epochs],
         ),
         'ang': SequentialLR(
             optimizers['ang'],
-            [
-                LinearLR(optimizers['ang'], start_factor=0.2, end_factor=1.0, total_iters=warmup_epochs),
-                CosineAnnealingLR(optimizers['ang'], T_max=max(total_epochs - warmup_epochs, 1)),
-            ],
-            milestones=[warmup_epochs]
+            [LinearLR(optimizers['ang'], start_factor=0.2, end_factor=1.0, total_iters=warmup_epochs),
+             CosineAnnealingLR(optimizers['ang'], T_max=total_epochs - warmup_epochs)],
+            milestones=[warmup_epochs],
         ),
     }
 
-    # (선택) param_sets: parameter grouping을 추적하고 싶다면 id로 집합 구성
     param_sets = {
         'kpt': set(id(p) for p in params_kpt),
         'ang': set(id(p) for p in params_ang),
     }
+
+    if rank == 0:
+        print(f"[setup] #params(kpt)={len(param_sets['kpt'])}, #params(ang)={len(param_sets['ang'])}, "
+              f"total_trainable={sum(p.requires_grad for p in m.parameters())}")
 
     return model, train_loader, val_loader, criteria, optimizers, schedulers, device, mean, std, train_sampler, param_sets, strong_transform

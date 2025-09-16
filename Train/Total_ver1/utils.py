@@ -123,13 +123,11 @@ def _euler_deg_to_rodrigues(euler_deg: Sequence[float], order: str = "zyx") -> n
     rvec, _ = cv2.Rodrigues(Rm.astype(np.float32))
     return rvec.reshape(3).astype(np.float32)
 
-
 def compose_Rt_from_rvec_tvec(rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
     """rvec(3,), tvec(3,) -> Rt(3x4)"""
     Rm, _ = cv2.Rodrigues(rvec.astype(np.float32))
     Rt = np.concatenate([Rm, tvec.reshape(3, 1).astype(np.float32)], axis=1)
     return Rt
-
 
 def project_3d_to_2d(points_3d: np.ndarray,
                      K: np.ndarray,
@@ -181,12 +179,112 @@ def project_3d_to_2d(points_3d: np.ndarray,
                                dist)
     return pts.reshape(-1, 2).astype(np.float32)
 
+def project_3d_to_2d_meca500_legacy(points_3d: np.ndarray,
+                                    aruco_result: Dict[str, float],
+                                    camera_matrix: np.ndarray,
+                                    dist_coeffs: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    MECA500 레거시 방식:
+      - rvec_x/y/z 를 '축별 각도(deg)' 로 가정하고 rad로 변환 후
+        Rodrigues 벡터처럼 cv2.projectPoints에 그대로 전달.
+      - 현재 보유한 MECA500 GT 재현용.
+    """
+    # 안전한 키 접근 (rvec_*_deg 우선, 없으면 rvec_*)
+    rvec_deg = np.array([
+        aruco_result.get('rvec_x_deg', aruco_result.get('rvec_x', 0.0)),
+        aruco_result.get('rvec_y_deg', aruco_result.get('rvec_y', 0.0)),
+        aruco_result.get('rvec_z_deg', aruco_result.get('rvec_z', 0.0)),
+    ], dtype=np.float32)
+    rvec = np.deg2rad(rvec_deg).reshape(3, 1).astype(np.float32)
+
+    tvec = np.array([
+        aruco_result.get('tvec_x', aruco_result.get('mean_x', 0.0)),
+        aruco_result.get('tvec_y', aruco_result.get('mean_y', 0.0)),
+        aruco_result.get('tvec_z', aruco_result.get('mean_z', 0.0)),
+    ], dtype=np.float32).reshape(3, 1)
+
+    # OpenCV 입력 형식/dtype 정규화
+    pts3d = np.asarray(points_3d, dtype=np.float32).reshape(-1, 1, 3)
+    K = np.asarray(camera_matrix, dtype=np.float32)
+    D = None if dist_coeffs is None else np.asarray(dist_coeffs, dtype=np.float32)
+
+    pix, _ = cv2.projectPoints(pts3d, rvec, tvec, K, D)
+    return pix.reshape(-1, 2).astype(np.float32)
+
+def project_3d_to_2d_fr5_legacy(points_3d: np.ndarray,
+                                aruco_result: Dict[str, float],
+                                K_new: np.ndarray,
+                                dist: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    FR5 레거시 방식:
+      - rvec_x/y/z 를 '축별 각도(deg)' 로 가정하고 각 성분을 rad로 변환하여
+        Rodrigues 벡터처럼 cv2.projectPoints에 그대로 전달.
+      - 현재 보유한 FR5 GT 재현용.
+    """
+    Rvec = np.array([
+        math.radians(aruco_result['rvec_x']),
+        math.radians(aruco_result['rvec_y']),
+        math.radians(aruco_result['rvec_z']),
+    ], dtype=np.float32).reshape(3, 1)
+
+    Tvec = np.array([
+        aruco_result['tvec_x'],
+        aruco_result['tvec_y'],
+        aruco_result['tvec_z'],
+    ], dtype=np.float32).reshape(3, 1)
+
+    pix, _ = cv2.projectPoints(points_3d.astype(np.float32),
+                               Rvec, Tvec,
+                               K_new.astype(np.float32),
+                               dist)
+    return pix.reshape(-1, 2).astype(np.float32)
+
+def project_3d_to_2d_by_robot(points_3d: np.ndarray,
+                              robot: str,
+                              aruco_result: Dict[str, float],
+                              K: np.ndarray,
+                              dist: Optional[np.ndarray] = None,
+                              *,
+                              force_legacy: Optional[bool] = None,
+                              prefer_euler_keys: bool = False,
+                              euler_order: str = "zyx") -> np.ndarray:
+    """
+    로봇별 3D→2D 투영 라우팅.
+    - FR5 기본: 레거시 방식(project_3d_to_2d_fr5_legacy)
+    - MECA500 기본: 레거시 방식(project_3d_to_2d_meca500_legacy)
+    - 그 외(FR3 등): 안전 라우팅(project_3d_to_2d_aruco)
+    파라미터:
+      force_legacy: True면 레거시 강제, False면 안전 라우팅 강제, None이면 로봇별 기본.
+      prefer_euler_keys: 안전 라우팅 사용 시 *_deg 키가 있으면 Euler로 처리할지 여부.
+    """
+    rob = (robot or "").lower()
+
+    # 레거시 기본 선택: FR5, MECA500
+    if force_legacy is None:
+        use_legacy = (rob in ("fr5", "meca500", "meca"))
+    else:
+        use_legacy = bool(force_legacy)
+
+    if use_legacy:
+        if rob in ("meca500", "meca"):
+            return project_3d_to_2d_meca500_legacy(points_3d, aruco_result, K, dist)
+        elif rob == "fr5":
+            return project_3d_to_2d_fr5_legacy(points_3d, aruco_result, K, dist)
+        # 레거시 강제인데 다른 로봇이면 안전 라우팅으로 폴백
+        return project_3d_to_2d_aruco(points_3d, aruco_result, K, dist,
+                                      prefer_euler_keys=prefer_euler_keys,
+                                      euler_order=euler_order)
+    else:
+        # 안전 라우팅
+        return project_3d_to_2d_aruco(points_3d, aruco_result, K, dist,
+                                      prefer_euler_keys=prefer_euler_keys,
+                                      euler_order=euler_order)
 
 def project_3d_to_2d_aruco(points_3d: np.ndarray,
                            aruco_result: Dict[str, float],
                            K: np.ndarray,
                            dist: Optional[np.ndarray] = None,
-                           prefer_euler_keys: bool = True,
+                           prefer_euler_keys: bool = False,
                            euler_order: str = "zyx") -> np.ndarray:
     """
     ArUco 결과 딕셔너리(rvec,tvec 혹은 rvec_*_deg, tvec_*)를 안전 처리.
@@ -422,18 +520,19 @@ def angle_to_joint_coordinate_FR5(joint_angles: Sequence[float],
     else:
         raise ValueError("input_unit must be 'rad' or 'deg'")
 
-    T = np.eye(4, dtype=np.float32)
+    T_base_correction = np.eye(4)
     if selected_view in FR5_VIEW_ROTATIONS:
-        T[:3, :3] = FR5_VIEW_ROTATIONS[selected_view].as_matrix().astype(np.float32)
+        T_base_correction[:3, :3] = FR5_VIEW_ROTATIONS[selected_view].as_matrix().astype(np.float32)
 
+    T_cumulative = T_base_correction
     base_point = np.array([[0.0], [0.0], [0.0], [1.0]], dtype=np.float32)
     pts = [base_point[:3, 0].copy()]  # base
 
     for i, p in enumerate(FR5_DH_PARAMETERS):
+        
         theta = (joint_deg[i] if i < len(joint_deg) else 0.0) + p.theta_offset
-        T = T @ _get_modified_dh_matrix(p.a, p.d, p.alpha, theta)
-        pts.append((T @ base_point)[:3, 0])
-
+        T_cumulative = T_cumulative @ _get_modified_dh_matrix(p.a, p.d, p.alpha, theta)
+        pts.append((T_cumulative @ base_point)[:3, 0])
     return np.array(pts, dtype=np.float32)  # (7,3)
 
 
@@ -452,8 +551,9 @@ def angle_to_joint_coordinate(joint_angles: Sequence[float],
             joint_angles, selected_view or "view1", input_unit=input_unit
         )
     elif rob == "fr5":
+        iu = input_unit if input_unit in ("deg", "rad") else "deg"
         return angle_to_joint_coordinate_FR5(
-            joint_angles, selected_view or "top", input_unit=input_unit
+            joint_angles, selected_view or "top", input_unit=iu
         )
     elif rob in ("meca500", "meca"):
         # MECA500은 기본 deg 로깅을 많이 쓰므로 기본을 "deg"로 둡니다.
