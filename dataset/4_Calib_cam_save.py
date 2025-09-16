@@ -29,7 +29,6 @@ output_dir2 = "./franka_research3/franka_research_calib_cam_from_conf"
 os.makedirs(output_dir, exist_ok=True)
 os.makedirs(output_dir2, exist_ok=True)
 
-
 # --- 🛠️ 2. 헬퍼 함수 ---
 
 def load_fhd_calibration(conf_path, side):
