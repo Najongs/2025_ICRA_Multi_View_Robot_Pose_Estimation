@@ -12,6 +12,8 @@ __pycache__/
 *.pt
 *.pth
 *.png
+*.csv
+
 
 dinov3/
 DINOv3/
