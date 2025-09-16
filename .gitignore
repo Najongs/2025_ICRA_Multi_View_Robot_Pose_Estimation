@@ -21,6 +21,7 @@ __pycache__/
 dinov3/
 DINOv3/
 wandb/
+model/wandb/
 
 results/
 # C extensions
