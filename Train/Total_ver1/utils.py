@@ -7,20 +7,37 @@ import numpy as np
 import cv2
 from scipy.spatial.transform import Rotation as R
 
-# =========================================================
-# 공용 상수 (기본값: Franka Research 3)
-# =========================================================
-MODEL_NAME = "facebook/dinov3-vitb16-pretrain-lvd1689m"
-NUM_ANGLES = 7            # FR3: 7 DOF
-NUM_JOINTS = 8            # 베이스 포함 8 포인트
-FEATURE_DIM = 768
-HEATMAP_SIZE: Tuple[int, int] = (128, 128)
 MAX_VIEWS_PER_GROUP = 8
 
-ROBOT_DOF = {"fr3": 7, "fr5": 6, "meca500": 6}
-def get_dof(robot: str) -> int:
-    return ROBOT_DOF[robot.lower()]
+# =========================================================
+# 공용 상수
+# =========================================================
+@dataclass(frozen=True)
+class RobotSpec:
+    num_angles: int
+    num_joints: int
+    heatmap_size: Tuple[int, int]
+    max_views_per_group: int
 
+ROBOT_SPECS: Dict[str, RobotSpec] = {
+    "fr3":     RobotSpec(num_angles=7, num_joints=8, heatmap_size=(128,128), max_views_per_group=8),
+    "fr5":     RobotSpec(num_angles=6, num_joints=7, heatmap_size=(128,128), max_views_per_group=8),
+    "meca500": RobotSpec(num_angles=6, num_joints=7, heatmap_size=(128,128), max_views_per_group=8),
+}
+
+def get_spec(robot: str) -> RobotSpec:
+    rob = robot.lower()
+    if rob not in ROBOT_SPECS:
+        raise ValueError(f"Unknown robot: {robot}")
+    return ROBOT_SPECS[rob]
+
+# (선택) 레거시 코드 호환: 기존 전역 상수를 “로봇별 값”으로 갱신
+def set_globals_for(robot: str) -> None:
+    spec = get_spec(robot)
+    globals()["NUM_ANGLES"] = spec.num_angles
+    globals()["NUM_JOINTS"] = spec.num_joints
+    globals()["HEATMAP_SIZE"] = spec.heatmap_size
+    globals()["MAX_VIEWS_PER_GROUP"] = spec.max_views_per_group
 
 # =========================================================
 # ---- Heatmap Utilities
@@ -564,19 +581,26 @@ def angle_to_joint_coordinate(joint_angles: Sequence[float],
     else:
         raise ValueError("robot must be 'fr3' or 'fr5' or 'meca500'")
 
-
 # =========================================================
-# ---- Grouping Utilities
+# ---- Grouping Utilities (스펙 기반으로 정리)
 # =========================================================
 def perform_grouping_fr3(df,
                          tolerance: float,
-                         max_views: int = MAX_VIEWS_PER_GROUP) -> List[Dict]:
+                         max_views: Optional[int] = None,
+                         num_angles: Optional[int] = None) -> List[Dict]:
     """
     FR3 로깅 포맷 전용 그룹핑.
     필요한 컬럼:
       - 'robot_timestamp', 'image_path',
       - 'position_fr3_joint1'..'position_fr3_joint7'
+    스펙 미지정 시 get_spec('fr3')에서 num_angles/max_views를 자동 적용.
     """
+    spec = get_spec("fr3")
+    if max_views is None:
+        max_views = spec.max_views_per_group
+    if num_angles is None:
+        num_angles = spec.num_angles
+
     groups: List[Dict] = []
     if df is None or len(df) == 0:
         return groups
@@ -587,20 +611,19 @@ def perform_grouping_fr3(df,
     cur = []
     for _, row in df.iterrows():
         if not cur:
-            cur.append(row)
-            continue
+            cur.append(row); continue
         start = cur[0]["robot_timestamp"]
         time_ok = (row["robot_timestamp"] - start) <= tolerance
         size_ok = len(cur) < max_views
         if time_ok and size_ok:
             cur.append(row)
         else:
-            joint_angles = [cur[0][f"position_fr3_joint{j}"] for j in range(1, NUM_ANGLES + 1)]
+            joint_angles = [cur[0][f"position_fr3_joint{j}"] for j in range(1, num_angles + 1)]
             image_paths = [{"image_path": v["image_path"]} for v in cur]
             groups.append({"views": image_paths, "joint_angles": joint_angles})
             cur = [row]
     if cur:
-        joint_angles = [cur[0][f"position_fr3_joint{j}"] for j in range(1, NUM_ANGLES + 1)]
+        joint_angles = [cur[0][f"position_fr3_joint{j}"] for j in range(1, num_angles + 1)]
         image_paths = [{"image_path": v["image_path"]} for v in cur]
         groups.append({"views": image_paths, "joint_angles": joint_angles})
     return groups
@@ -608,17 +631,20 @@ def perform_grouping_fr3(df,
 
 def perform_grouping_meca500(df,
                              tolerance: float,
-                             max_views: int = MAX_VIEWS_PER_GROUP,
+                             max_views: Optional[int] = None,
                              angle_prefix: str = "meca_joint",
-                             angle_count: int = 6,
+                             angle_count: Optional[int] = None,
                              timestamp_col: str = "robot_timestamp") -> List[Dict]:
     """
-    MECA500 전용/범용 그룹핑:
-      - timestamp_col: 프레임/조인트 동기화를 위한 타임스탬프 컬럼명
-      - 각 조인트 컬럼은 f"{angle_prefix}{i}" (1..angle_count) 형식 가정 (필요시 맞춰 사용)
-    결과:
-      [{'views': [{'image_path': str}, ...], 'joint_angles': [a1..aN]}, ...]
+    MECA500 전용/범용 그룹핑.
+    스펙 미지정 시 get_spec('meca500')에서 angle_count/max_views를 자동 적용.
     """
+    spec = get_spec("meca500")
+    if max_views is None:
+        max_views = spec.max_views_per_group
+    if angle_count is None:
+        angle_count = spec.num_angles
+
     groups: List[Dict] = []
     if df is None or len(df) == 0:
         return groups
@@ -630,8 +656,7 @@ def perform_grouping_meca500(df,
     cur = []
     for _, row in df.iterrows():
         if not cur:
-            cur.append(row)
-            continue
+            cur.append(row); continue
         start = cur[0][timestamp_col]
         time_ok = (row[timestamp_col] - start) <= tolerance
         size_ok = len(cur) < max_views
@@ -648,16 +673,24 @@ def perform_grouping_meca500(df,
         groups.append({"views": image_paths, "joint_angles": joint_angles})
     return groups
 
+
 def perform_grouping_fr5(df,
                          tolerance: float,
-                         max_views: int = MAX_VIEWS_PER_GROUP,
-                         angle_count: int = len(FR5_DH_PARAMETERS)) -> List[Dict]:
+                         max_views: Optional[int] = None,
+                         angle_count: Optional[int] = None) -> List[Dict]:
     """
     FR5 로그 포맷 전용 그룹핑.
     필요한 컬럼:
       - 'joint_timestamp', 'image_path',
       - f'joint_1'..f'joint_{angle_count}'
+    스펙 미지정 시 get_spec('fr5')에서 angle_count/max_views를 자동 적용.
     """
+    spec = get_spec("fr5")
+    if max_views is None:
+        max_views = spec.max_views_per_group
+    if angle_count is None:
+        angle_count = spec.num_angles
+
     groups: List[Dict] = []
     if df is None or len(df) == 0:
         return groups
@@ -668,8 +701,7 @@ def perform_grouping_fr5(df,
     cur = []
     for _, row in df.iterrows():
         if not cur:
-            cur.append(row)
-            continue
+            cur.append(row); continue
         start = cur[0]["joint_timestamp"]
         time_ok = (row["joint_timestamp"] - start) <= tolerance
         size_ok = len(cur) < max_views
@@ -687,20 +719,25 @@ def perform_grouping_fr5(df,
     return groups
 
 
-
-# 통합 그룹핑 라우팅에도 'meca500' 추가
 def perform_grouping(df,
                      tolerance: float,
-                     max_views: int = MAX_VIEWS_PER_GROUP,
+                     max_views: Optional[int] = None,
                      robot: str = "fr3") -> List[Dict]:
-    """로봇 타입에 맞춰 그룹핑 라우팅."""
+    """
+    로봇 타입에 맞춰 그룹핑 라우팅.
+    max_views가 None이면 해당 로봇 스펙에서 자동 사용.
+    """
     rob = robot.lower()
+    spec = get_spec(rob)
+    if max_views is None:
+        max_views = spec.max_views_per_group
+
     if rob == "fr3":
-        return perform_grouping_fr3(df, tolerance, max_views)
+        return perform_grouping_fr3(df, tolerance, max_views=max_views)
     elif rob == "fr5":
-        return perform_grouping_fr5(df, tolerance, max_views)
+        return perform_grouping_fr5(df, tolerance, max_views=max_views)
     elif rob in ("meca500", "meca"):
-        return perform_grouping_meca500(df, tolerance, max_views)
+        return perform_grouping_meca500(df, tolerance, max_views=max_views)
     else:
         # 기본은 FR3 규칙
-        return perform_grouping_fr3(df, tolerance, max_views)
+        return perform_grouping_fr3(df, tolerance, max_views=max_views)

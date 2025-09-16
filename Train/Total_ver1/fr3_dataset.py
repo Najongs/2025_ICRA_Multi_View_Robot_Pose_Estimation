@@ -6,8 +6,8 @@ from torch.utils.data import Dataset
 from PIL import Image
 from typing import Dict, List, Tuple, Optional
 
+from utils import get_spec
 from franka_research3_utils import (
-    NUM_JOINTS, NUM_ANGLES, HEATMAP_SIZE, MAX_VIEWS_PER_GROUP,
     create_gt_heatmap, angle_to_joint_coordinate, project_3d_to_2d
 )
 
@@ -72,15 +72,16 @@ class FR3_RobotPoseDataset(Dataset):
     def __init__(self,
                  groups,
                  transform=None,
-                 HEATMAP_SIZE=(128, 128),
                  sigma=5.0,
                  input_size: int = 224):
+        self.spec = get_spec("fr3")  # ✅ 단일 소스
+        self.num_joints = get_spec("fr3").num_joints  # ★ 스펙 기반(=8)
+        self.heatmap_size = self.spec.heatmap_size
+        self.max_views = self.spec.max_views_per_group
         self.groups = groups
         self.transform = transform
-        self.heatmap_size = tuple(HEATMAP_SIZE)
         self.sigma = float(sigma)
         self.input_size = int(input_size)
-        self.max_views = int(MAX_VIEWS_PER_GROUP)  # ★ 추가
         
         print("[FR3] Loading and preprocessing metadata...")
         self.aruco_lookup: Dict[str, Dict] = {}
@@ -179,18 +180,23 @@ class FR3_RobotPoseDataset(Dataset):
                 K_new, _ = cv2.getOptimalNewCameraMatrix(cam_mat, dist_coeff, (w, h), alpha=0)
                 undist = cv2.undistort(img_rgb, cam_mat, dist_coeff, None, K_new)
 
-                joints_3d = angle_to_joint_coordinate(joint_angles_rad, view)
-                kpts_2d = project_3d_to_2d(joints_3d, aruco, K_new, dist=None).astype(np.float32)
+                joints_3d = angle_to_joint_coordinate(joint_angles_rad[0:self.spec.num_angles], view)
+                kpts_2d_full = project_3d_to_2d(joints_3d, aruco, K_new, dist=None).astype(np.float32)
 
                 IN = self.input_size
                 resized = cv2.resize(undist, (IN, IN), interpolation=cv2.INTER_LINEAR)
                 kpts_on_IN = _scale_points(kpts_2d, from_size=(w, h), to_size=(IN, IN))
 
+                # ---- 스펙 개수(=8)로 슬라이스
+                J = int(self.num_joints)  # 보통 8
+                kpts_2d = kpts_2d_full[:J, :]  # ★ 마지막(EE 등) 제외
+
                 Ht, Wt = self.heatmap_size
                 kpts_hm = _scale_points(kpts_on_IN, from_size=(IN, IN), to_size=(Wt, Ht))
 
-                heatmaps_np = np.zeros((NUM_JOINTS, Ht, Wt), dtype=np.float32)
-                for j in range(NUM_JOINTS):
+                J = self.spec.num_joints
+                heatmaps_np = np.zeros((J, Ht, Wt), dtype=np.float32)
+                for j in range(J):
                     heatmaps_np[j] = create_gt_heatmap(kpts_hm[j], (Ht, Wt), self.sigma)
 
                 img_pil = Image.fromarray(resized)

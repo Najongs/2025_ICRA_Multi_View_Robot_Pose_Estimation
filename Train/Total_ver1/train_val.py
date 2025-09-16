@@ -44,6 +44,45 @@ def _kpt_l2px_from_softargmax(pred_heat, gt_heat):
     d  = torch.sqrt(du*du + dv*dv)                          # (B*V,J)
     return d.mean().item()
 
+import os
+
+def _bjhw_or_bvjhw(t, name):
+    """(B,V,J,H,W) or (B,J,H,W)를 강제 점검. 기타 형태면 에러."""
+    if t.ndim == 5:
+        B,V,J,H,W = t.shape
+        # J/H/W가 헷갈리는 꼬임 방지를 위해 H/W는 16~1024, J는 보통 6~32 범위라 가정
+        # 여기서는 (B,V,J,H,W)라고 가정하고 assert로 고정
+        assert H >= 8 and W >= 8, f"[{name}] Expect H/W as spatial, got {t.shape}"
+        return t  # (B,V,J,H,W)
+    elif t.ndim == 4:
+        B,J,H,W = t.shape
+        assert H >= 8 and W >= 8, f"[{name}] Expect (B,J,H,W), got {t.shape}"
+        return t.unsqueeze(1)  # (B,1,J,H,W)로 승격
+    else:
+        raise AssertionError(f"[{name}] Unexpected shape {t.shape} (ndim={t.ndim})")
+
+def _align_joints(pred_hm, gt_hm, strict=True):
+    """
+    pred_hm, gt_hm: (B,V,J,H,W)
+    strict=True면 J 다르면 바로 Assert. False면 공통 min(J)로 잘라 임시 언블록.
+    """
+    Bp,Vp,Jp,Hp,Wp = pred_hm.shape
+    Bg,Vg,Jg,Hg,Wg = gt_hm.shape
+    assert (Bp==Bg) and (Vp==Vg) and (Hp==Hg) and (Wp==Wg), \
+        f"[align] Shape mismatch pred={pred_hm.shape} gt={gt_hm.shape}"
+
+    if Jp == Jg:
+        return pred_hm, gt_hm
+
+    if strict:
+        raise AssertionError(f"[align] NUM_JOINTS mismatch: pred={Jp}, gt={Jg}")
+
+    J = min(Jp, Jg)
+    if Jp != J: pred_hm = pred_hm[:, :, :J]
+    if Jg != J: gt_hm   = gt_hm[:, :, :J]
+    return pred_hm, gt_hm
+
+
 def train_one_epoch(model, loader, optimizers, criteria, device,
                     loss_weight_kpt, epoch_idx, param_sets, scalers):
     """
@@ -92,8 +131,27 @@ def train_one_epoch(model, loader, optimizers, criteria, device,
             out = model(images)  # {"heatmaps": (B,V,J,H,W), ...}
             pred_hm = out["heatmaps"]
 
-            # KPT loss (MSE, 유효뷰만 평균)
+            # === 규격화 & 검증 ===
+            pred_hm = _bjhw_or_bvjhw(pred_hm, "pred_hm")   # (B,V,J,H,W)
+            gt_hm_t = _bjhw_or_bvjhw(gt_hm_t, "gt_hm_t")   # (B,V,J,H,W)
+
+            # rank 포함 디버그(1회만 찍고 싶으면 조건 달아라)
+            if os.environ.get("LOCAL_RANK", "0") == "0":
+                print(f"[DEBUG] pred {tuple(pred_hm.shape)} | gt {tuple(gt_hm_t.shape)}")
+
+            # 관절 채널 정렬: 개발 중엔 strict=True로 조기 실패 유도
+            # 일단 ‘돌려보기’가 필요하면 strict=False로 바꿔 임시 언블록
+            strict_align = True
+            try:
+                pred_hm, gt_hm_t = _align_joints(pred_hm, gt_hm_t, strict=strict_align)
+            except AssertionError as e:
+                # 임시 언블록 경로 (원인 파악용 로그 남기고 클램프)
+                print(f"[WARN] {e} → fallback to min(J) clamp")
+                pred_hm, gt_hm_t = _align_joints(pred_hm, gt_hm_t, strict=False)
+
+            # === KPT loss ===
             diff = (pred_hm - gt_hm_t) ** 2
+
             diff = diff * valid_mask
             denom = valid_mask.sum().clamp_min(1.0)
             loss_kpt = diff.sum() / denom

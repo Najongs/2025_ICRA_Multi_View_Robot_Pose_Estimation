@@ -1,4 +1,3 @@
-# main.py
 """
 통합 DREAM-robot 학습 스크립트 (FR3 / FR5 / MECA500)
 - torchrun DDP 지원
@@ -36,6 +35,7 @@ from dataset import build_items_from_csv, SPECS   # 함수/상수만 직접 impo
 from setup import setup
 from models import DINOv3PoseEstimator, ModelCfg
 from train_val import train_one_epoch, evaluate
+from utils import get_spec, set_globals_for       # ✅ 스펙 단일 소스
 
 class _ModelForVis(torch.nn.Module):
     def __init__(self, wrapped):
@@ -107,11 +107,11 @@ def parse_args():
     ap.add_argument("--final-tol", type=float, default=None)
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--name", type=str, default=None)
-    
+
     ap.add_argument("--viz-start", type=int, default=8,
                     help="시작 시 GT 디버그 시각화 샘플 개수(0이면 비활성)")
     ap.add_argument("--viz-dir", type=str, default="viz_start",
-                    help="시작 시각화 저장 폴더명(러ン 디렉토리 내부)")
+                    help="시작 시각화 저장 폴더명(런 디렉토리 내부)")
     # backbone / fusion
     ap.add_argument("--model-id", type=str,
                     default="facebook/dinov3-convnext-large-pretrain-lvd1689m")
@@ -154,6 +154,13 @@ def main():
     world_size = dist.get_world_size()
     robot = args.robot.lower()
 
+    # ✅ 로봇 스펙을 전역 상수로 동기화(레거시 호환) + spec 객체 획득
+    set_globals_for(robot)
+    spec = get_spec(robot)
+    if rank == 0:
+        print(f"[CFG] robot={robot} -> NUM_ANGLES={spec.num_angles}, NUM_JOINTS={spec.num_joints}, "
+              f"HEATMAP_SIZE={spec.heatmap_size}, MAX_VIEWS={spec.max_views_per_group}")
+
     # ✅ 로봇별 전용 Dataset으로 클래스 교체
     _patch_dataset_class(robot)
 
@@ -174,7 +181,8 @@ def main():
         'lr_backbone': 1e-7,
         'lambda_fk': 0.5,
         'input_size': 224,
-        'heatmap_size': (128, 128),
+        # ✅ spec 반영
+        'heatmap_size': spec.heatmap_size,
         'sigma': 5.0,
         'num_workers': 8,
         'warmup_epochs': 5,
@@ -200,7 +208,8 @@ def main():
     items = build_items_from_csv(
         dataset_type=robot,
         csv_filename=csv_filename,
-        max_views_per_group=8,
+        # ✅ spec 반영
+        max_views_per_group=spec.max_views_per_group,
         do_grid_search=bool(args.do_grid and robot in ("fr3", "fr5")),
         final_tolerance=args.final_tol,
         grid_candidates=grid_cands,
@@ -217,14 +226,14 @@ def main():
         n_pairs  = len(items) - n_groups
         print(f"Items: groups={n_groups}, pairs={n_pairs}, total={len(items)}")
 
-    # Model Config
+    # Model Config (스펙 반영)
     cfg = ModelCfg(
         MODEL_NAME=args.model_id,
-        NUM_ANGLES=6 if robot in ("fr5", "meca500") else 7,
-        NUM_JOINTS=16,
+        NUM_ANGLES=spec.num_angles,
+        NUM_JOINTS=spec.num_joints,
         FEATURE_DIM=args.feature_dim,
         HEATMAP_SIZE=hparams['heatmap_size'],
-        MAX_VIEWS_PER_GROUP=8,
+        MAX_VIEWS_PER_GROUP=spec.max_views_per_group,
         FUSION=args.fusion,
         DEFAULT_FUSION_FOR_MULTI=args.fusion_default_multi,
         FREEZE_BACKBONE=args.freeze_backbone,
