@@ -22,6 +22,7 @@ dinov3/
 DINOv3/
 wandb/
 model/wandb/
+train/wandb/
 
 results/
 # C extensions
