@@ -19,6 +19,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision import transforms
 from PIL import Image
 from transformers import AutoModel, SiglipVisionModel
+from scipy.spatial.transform import Rotation as R
 
 # DDP 관련 라이브러리
 import torch.distributed as dist
@@ -63,6 +64,7 @@ def _scale_points(points_xy, from_size, to_size):
     out[:, 1] = points_xy[:, 1] * (Ht / float(Hf))
     return out
 
+# ===== Dataset __getitem__ 반환 통일 =====
 class RobotPoseDataset(Dataset):
     def __init__(self, json_files, transform, sigma=2.0):
         self.json_files = json_files
@@ -80,54 +82,65 @@ class RobotPoseDataset(Dataset):
         image_path = sample['meta']['image_path']
         img_bgr = cv2.imread(image_path)
         if img_bgr is None:
-            print(f"Warning: Could not read image {image_path}. Skipping.")
+            # 다음 샘플로 대체
             return self.__getitem__((idx + 1) % len(self))
-            
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         h, w = img_rgb.shape[:2]
         img_pil = Image.fromarray(img_rgb)
         image_tensor = self.transform(img_pil)
 
+        # 2D heatmap GT
         Ht, Wt = (224, 224)
         keypoints = sample["objects"][0]["keypoints"]
         joint_num = len(keypoints)
-        kpts_2d_orig = np.array([kp["projected_location"] for kp in keypoints])
+        kpts_2d_orig = np.array([kp["projected_location"] for kp in keypoints], dtype=np.float32)
         kpts_on_heatmap = _scale_points(kpts_2d_orig, from_size=(w, h), to_size=(Wt, Ht))
-        
         heatmaps_np = np.zeros((joint_num, Ht, Wt), dtype=np.float32)
         for i in range(joint_num):
             heatmaps_np[i] = create_gt_heatmap(kpts_on_heatmap[i], (Ht, Wt), self.sigma)
-        gt_heatmaps = torch.from_numpy(heatmaps_np)
+        gt_heatmaps = torch.from_numpy(heatmaps_np)  # (J, H, W)
 
         angles = [angle["position"] for angle in sample['sim_state']["joints"]]
-        gt_angles = torch.tensor(angles, dtype=torch.float32)
-        
-        return image_tensor, gt_heatmaps, gt_angles
+        gt_angles = torch.tensor(angles, dtype=torch.float32)  # (A,)
+        gt_class = sample['objects'][0]['class']
+        gt_3d_points = torch.tensor([kp["location"] for kp in keypoints])  # (J,3)
+        K = torch.tensor(sample['meta']['K'], dtype=torch.float32)  # (3,3)
+        dist = torch.tensor(sample['meta']['dist_coeffs'], dtype=torch.float32)
+            
+        return image_tensor, gt_heatmaps, gt_angles, gt_class, gt_3d_points, K, dist
 
 def robot_collate_fn(batch):
-    images, heatmaps, angles = zip(*batch)
-    images = torch.stack(images, 0)
-
+    image_tensor, gt_heatmaps, gt_angles, gt_class, gt_3d_points, K, dist = zip(*batch)
+    image_tensors = torch.stack(image_tensor, 0)
+    
     MAX_JOINTS = 7
     MAX_ANGLES = 9
+    MAX_POINTS = 7
 
-    heatmaps_padded = torch.zeros(len(heatmaps), MAX_JOINTS, heatmaps[0].shape[1], heatmaps[0].shape[2])
-    angles_padded = torch.zeros(len(angles), MAX_ANGLES)
-    
-    joint_lengths, angle_lengths = [], []
-    for i, (h, a) in enumerate(zip(heatmaps, angles)):
+    heatmaps_padded = torch.zeros(len(gt_heatmaps), MAX_JOINTS, gt_heatmaps[0].shape[1], gt_heatmaps[0].shape[2])
+    angles_padded   = torch.zeros(len(gt_angles), MAX_ANGLES)
+    points_padded   = torch.zeros(len(gt_3d_points), MAX_POINTS, 3)
+
+    joint_lengths = torch.zeros(len(gt_heatmaps), dtype=torch.long)  # 각 샘플의 joint 개수
+    angle_lengths = torch.zeros(len(gt_angles), dtype=torch.long)    # 각 샘플의 angle 개수
+    point_lengths = torch.zeros(len(gt_3d_points), dtype=torch.long) # 각 샘플의 3D point 개수
+
+    for i, (h, a, p) in enumerate(zip(gt_heatmaps, gt_angles, gt_3d_points)):
         joint_num = h.shape[0]
         angle_num = a.shape[0]
-        joint_lengths.append(joint_num)
-        angle_lengths.append(angle_num)
+        point_num = p.shape[0]
 
         heatmaps_padded[i, :joint_num, :, :] = h
         angles_padded[i, :angle_num] = a
+        points_padded[i, :point_num] = p
 
-    joint_lengths = torch.tensor(joint_lengths, dtype=torch.long)
-    angle_lengths = torch.tensor(angle_lengths, dtype=torch.long)
-    return images, heatmaps_padded, angles_padded, joint_lengths, angle_lengths
+        joint_lengths[i] = joint_num
+        angle_lengths[i] = angle_num
+        point_lengths[i] = point_num
 
+    K = torch.stack(K, 0)
+    
+    return image_tensors, heatmaps_padded, angles_padded, gt_class, points_padded, K, dist, joint_lengths, angle_lengths, point_lengths
 
 FEATURE_DIM = 512
 NUM_ANGLES = 9
@@ -308,32 +321,287 @@ class DINOv3PoseEstimator(nn.Module):
         
         return predicted_heatmaps, predicted_angles
 
-def compute_masked_loss(pred_heatmaps, gt_heatmaps,
-                        pred_angles, gt_angles,
-                        joint_lengths, angle_lengths,
-                        loss_fn_h, loss_fn_a,
-                        weight_h, weight_a):
+# ======================= 공통 DH 함수 =======================
+def get_dh_matrix(a, d, alpha, theta):
+    a_r, t_r = map(math.radians, (alpha, theta))
+    ca, sa, ct, st = np.cos(a_r), np.sin(a_r), np.cos(t_r), np.sin(t_r)
+    return np.array([
+        [ ct, -st*ca,  st*sa, a*ct],
+        [ st,  ct*ca, -ct*sa, a*st],
+        [  0,     sa,     ca,    d],
+        [  0,      0,      0,    1]
+    ])
+
+def get_modified_dh_matrix(a, d, alpha, theta):
+    a_r, t_r = map(math.radians, (alpha, theta))
+    ca, sa, ct, st = np.cos(a_r), np.sin(a_r), np.cos(t_r), np.sin(t_r)
+    return np.array([
+        [ ct, -st,  0, a],
+        [ st*ca, ct*ca, -sa, -d*sa],
+        [ st*sa, ct*sa,  ca,  d*ca],
+        [ 0, 0, 0, 1]
+    ])
+
+# ======================= 베이스 클래스 =======================
+class RobotKinematics:
+    def __init__(self, name):
+        self.name = name
+    
+    def forward_kinematics(self, joint_angles, view=None):
+        raise NotImplementedError
+
+    def _truncate_angles(self, joint_angles):
+        return joint_angles[:len(self.dh_params)]
+
+# ======================= Meca500 =======================
+class MecaInsertionKinematics(RobotKinematics):
+    def __init__(self):
+        super().__init__("MecaInsertion")
+        self.dh_params = [
+            {'alpha': -90, 'a': 0,     'd': 0.135, 'theta_offset': 0},
+            {'alpha': 0,   'a': 0.135, 'd': 0,     'theta_offset': -90},
+            {'alpha': -90, 'a': 0.038, 'd': 0,     'theta_offset': 0},
+            {'alpha': 90,  'a': 0,     'd': 0.120, 'theta_offset': 0},
+            {'alpha': -90, 'a': 0,     'd': 0,     'theta_offset': 0},
+            {'alpha': 0,   'a': 0,     'd': 0.070, 'theta_offset': 0}
+        ]
+        # 베이스 보정
+        rot_x_180 = R.from_euler('x', 180, degrees=True)
+        rot_z_90 = R.from_euler('z', 90, degrees=True)
+        self.base_correction = (rot_z_90 * rot_x_180).as_matrix()
+
+    def forward_kinematics(self, joint_angles, view=None):
+        joint_coords = [np.array([0,0,0])]
+        T_cumulative = np.eye(4)
+        T_cumulative[:3,:3] = self.base_correction
+        base_point = np.array([[0],[0],[0],[1]])
+        for i, params in enumerate(self.dh_params):
+            theta = math.degrees(joint_angles[i]) + params['theta_offset']
+            T_i = get_dh_matrix(params['a'], params['d'], params['alpha'], theta)
+            T_cumulative = T_cumulative @ T_i
+            joint_coords.append((T_cumulative @ base_point)[:3,0])
+        return np.array(joint_coords, dtype=np.float32)
+
+class Meca500Kinematics(RobotKinematics):
+    def __init__(self):
+        super().__init__("Meca500")
+        self.dh_params = [
+            {'alpha': -90, 'a': 0,     'd': 0.135, 'theta_offset': 0},
+            {'alpha': 0,   'a': 0.135, 'd': 0,     'theta_offset': -90},
+            {'alpha': -90, 'a': 0.038, 'd': 0,     'theta_offset': 0},
+            {'alpha': 90,  'a': 0,     'd': 0.120, 'theta_offset': 0},
+            {'alpha': -90, 'a': 0,     'd': 0,     'theta_offset': 0},
+            {'alpha': 0,   'a': 0,     'd': 0.070, 'theta_offset': 0}
+        ]
+    def forward_kinematics(self, joint_angles, view=None):
+        joint_coords_3d = [np.array([0, 0, 0])] # J0 (베이스)
+        T_cumulative = np.eye(4)
+        base_point = np.array([[0], [0], [0], [1]])
+        for i in range(6):
+            params = self.dh_params[i]
+            theta = math.degrees(joint_angles[i]) + params['theta_offset']
+            T_i = get_dh_matrix(params['a'], params['d'], params['alpha'], theta)
+            T_cumulative = T_cumulative @ T_i
+            joint_pos = T_cumulative @ base_point
+            joint_coords_3d.append(joint_pos[:3, 0])
+        return np.array(joint_coords_3d, dtype=np.float32)
+
+# ======================= Franka Research 3 =======================
+class Research3Kinematics(RobotKinematics):
+    def __init__(self):
+        super().__init__("research3")
+        self.dh_params = [
+            {'a': 0,      'd': 0.333, 'alpha':   0, 'theta_offset': 0}, 
+            {'a': 0,      'd': 0,     'alpha': -90, 'theta_offset': 0},
+            {'a': 0,      'd': 0.316, 'alpha':  90, 'theta_offset': 0},
+            {'a': 0.0825, 'd': 0,     'alpha':  90, 'theta_offset': 0},
+            {'a':-0.0825, 'd': 0.384, 'alpha': -90, 'theta_offset': 0},
+            {'a': 0,      'd': 0,     'alpha':  90, 'theta_offset': 0},
+            {'a': 0.088,  'd': 0,     'alpha':  90, 'theta_offset': 0}, 
+            {'a': 0,      'd': 0.107, 'alpha':   0, 'theta_offset': 0}
+        ]
+        self.view_rotations = {
+            'view1': R.from_euler('zyx',[90,180,0],degrees=True),
+            'view2': R.from_euler('zyx',[90,180,0],degrees=True),
+            'view3': R.from_euler('zyx',[90,180,0],degrees=True),
+            'view4': R.from_euler('zyx',[90,180,0],degrees=True)
+        }
+        # 제외할 인덱스 (0부터 시작, base point 포함)
+        self.exclude_indices = {1, 5}  
+
+    def forward_kinematics(self, joint_angles, view="view1"):
+        joint_coords = [np.array([0,0,0])]
+        T_cumulative = np.eye(4)
+        if view in self.view_rotations:
+            T_cumulative[:3,:3] = self.view_rotations[view].as_matrix()
+        base_point = np.array([[0],[0],[0],[1]])
+        for i, angle_rad in enumerate(joint_angles):
+            params = self.dh_params[i]
+            theta_deg = math.degrees(angle_rad) + params['theta_offset']
+            T_i = get_modified_dh_matrix(params['a'], params['d'], params['alpha'], theta_deg)
+            T_cumulative = T_cumulative @ T_i
+            joint_coords.append((T_cumulative @ base_point)[:3,0])
+        # 제외할 인덱스 제거 후 반환
+        filtered_coords = [pt for j, pt in enumerate(joint_coords) if j not in self.exclude_indices]
+        return np.array(filtered_coords, dtype=np.float32)
+
+
+# ======================= Panda franka =======================
+class PandaKinematics(RobotKinematics):
+    def __init__(self):
+        super().__init__("panda")
+        self.dh_params = [
+            {'a': 0,      'd': 0.333, 'alpha':   0, 'theta_offset': 0}, 
+            {'a': 0,      'd': 0,     'alpha': -90, 'theta_offset': 0},
+            {'a': 0,      'd': 0.316, 'alpha':  90, 'theta_offset': 0},
+            {'a': 0.0825, 'd': 0,     'alpha':  90, 'theta_offset': 0},
+            {'a':-0.0825, 'd': 0.384, 'alpha': -90, 'theta_offset': 0},
+            {'a': 0,      'd': 0,     'alpha':  90, 'theta_offset': 0},
+            {'a': 0.088,  'd': 0,     'alpha':  90, 'theta_offset': 0}, 
+            {'a': 0,      'd': 0.107, 'alpha':   0, 'theta_offset': 0}
+        ]
+        self.view_rotations = {
+            'view1': R.from_euler('zyx',[90,180,0],degrees=True),
+            'view2': R.from_euler('zyx',[90,180,0],degrees=True),
+            'view3': R.from_euler('zyx',[90,180,0],degrees=True),
+            'view4': R.from_euler('zyx',[90,180,0],degrees=True)
+        }
+        self.exclude_indices = {1, 5}
+
+    def forward_kinematics(self, joint_angles, view="view1"):
+        joint_coords = [np.array([0,0,0])]
+        T_cumulative = np.eye(4)
+        if view in self.view_rotations:
+            T_cumulative[:3,:3] = self.view_rotations[view].as_matrix()
+        base_point = np.array([[0],[0],[0],[1]])
+        for i, angle_rad in enumerate(joint_angles):
+            params = self.dh_params[i]
+            theta_deg = math.degrees(angle_rad) + params['theta_offset']
+            T_i = get_modified_dh_matrix(params['a'], params['d'], params['alpha'], theta_deg)
+            T_cumulative = T_cumulative @ T_i
+            joint_coords.append((T_cumulative @ base_point)[:3,0])
+        filtered_coords = [pt for j, pt in enumerate(joint_coords) if j not in self.exclude_indices]
+        return np.array(filtered_coords, dtype=np.float32)
+
+
+# ======================= FR5 =======================
+class Fr5Kinematics(RobotKinematics):
+    def __init__(self):
+        super().__init__("Fr5")
+        self.dh_params = [
+            {'alpha': 90,  'a': 0,      'd': 0.152, 'theta_offset': 0},
+            {'alpha': 0,   'a': -0.425, 'd': 0,     'theta_offset': 0},
+            {'alpha': 0,   'a': -0.395, 'd': 0,     'theta_offset': 0},
+            {'alpha': 90,  'a': 0,      'd': 0.102, 'theta_offset': 0},
+            {'alpha':-90,  'a': 0,      'd': 0.102, 'theta_offset': 0},
+            {'alpha': 0,   'a': 0,      'd': 0.100, 'theta_offset': 0}
+        ]
+        self.view_rotations = {
+            'top':   R.from_euler('zyx',[-85,0,180],degrees=True),
+            'left':  R.from_euler('zyx',[180,0,90], degrees=True),
+            'right': R.from_euler('zyx',[0,0,90],   degrees=True)
+        }
+
+    def forward_kinematics(self, joint_angles, view="top"):
+        joint_coords = [np.array([0,0,0])]
+        T_cumulative = np.eye(4)
+        if view in self.view_rotations:
+            T_cumulative[:3,:3] = self.view_rotations[view].as_matrix()
+        base_point = np.array([[0],[0],[0],[1]])
+        for i, params in enumerate(self.dh_params):
+            theta = math.degrees(joint_angles[i]) + params['theta_offset']
+            T_i = get_dh_matrix(params['a'], params['d'], params['alpha'], theta)
+            T_cumulative = T_cumulative @ T_i
+            joint_coords.append((T_cumulative @ base_point)[:3,0])
+        return np.array(joint_coords, dtype=np.float32)
+
+# ======================= 팩토리 함수 =======================
+ROBOT_CLASSES = {
+    "Meca500": Meca500Kinematics,
+    "MecaInsertion": MecaInsertionKinematics,
+    "research3": Research3Kinematics,
+    "Fr5":     Fr5Kinematics,
+    "panda":   PandaKinematics}
+
+def get_robot_kinematics(robot_name):
+    if robot_name not in ROBOT_CLASSES:
+        raise ValueError(f"Unknown robot: {robot_name}")
+    return ROBOT_CLASSES[robot_name]()
+
+def _to_np(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+def select_valid_correspondences(joints_3d_robot, kpts2d_padded):
+    joints_3d_robot = _to_np(joints_3d_robot).astype(np.float64)
+    kpts2d_padded   = _to_np(kpts2d_padded).astype(np.float64)
+    valid2d_mask = np.linalg.norm(kpts2d_padded, axis=1) > 0.0
+    idx2d = np.where(valid2d_mask)[0]
+
+    if idx2d.size == 0:
+        raise ValueError("No valid 2D keypoints found.")
+
+    # 로봇 FK로 나온 관절 개수와 2D 유효 개수의 최소치만 사용
+    n = int(min(len(joints_3d_robot), idx2d.size))
+    objp = joints_3d_robot[:n]          # (n,3)
+    imgp = kpts2d_padded[idx2d[:n]]     # (n,2)
+
+    if n < 4:
+        raise ValueError(f"Need at least 4 correspondences for PnP, got {n}.")
+    return objp, imgp
+
+def solve_pnp_from_fk(joints_3d_robot, kpts2d_padded, K, dist):
+    objp, imgp = select_valid_correspondences(joints_3d_robot, kpts2d_padded)
+    K   = _to_np(K).astype(np.float64)
+    dist= _to_np(dist).astype(np.float64).reshape(-1,)
+    ok, rvec, tvec = cv2.solvePnP(objp, imgp, K, dist, flags=cv2.SOLVEPNP_EPNP)
+    rvec = rvec.reshape(3)
+    tvec = tvec.reshape(3)
+    return rvec, tvec, bool(ok)
+
+def transform_robot_to_camera(joints_3d_robot, rvec, tvec):
+    joints_3d_robot = _to_np(joints_3d_robot).astype(np.float64)
+    R,_ = cv2.Rodrigues(rvec.reshape(3,1))
+    t = tvec.reshape(3,1)
+    X = joints_3d_robot.T  # (3,J)
+    Y = (R @ X + t).T      # (J,3)
+    return Y.astype(np.float32)
+
+def compute_masked_loss(pred_heatmaps, gt_heatmaps,pred_angles, gt_angles,pred_3d, gt_3d,joint_lengths, angle_lengths, point_lengths,loss_fn_h, loss_fn_a, loss_fn_3D,weight_h=1.0, weight_a=1.0, weight_3d=1.0):
 
     device = pred_heatmaps.device
     B, J, H, W = gt_heatmaps.shape
     A = gt_angles.shape[1]
-
-    # bool mask -> float로 캐스팅하는 편이 안전
+    N = gt_3d.shape[1]
+    
+    # 1) Heatmap Loss (masked)
     mask_h = (torch.arange(J, device=device)[None, :] < joint_lengths[:, None]).float()
-    mask_h = mask_h[:, :, None, None].expand_as(gt_heatmaps)
+    mask_h = mask_h[:, :, None, None].expand_as(gt_heatmaps)  # (B,J,H,W)
 
-    mask_a = (torch.arange(A, device=device)[None, :] < angle_lengths[:, None]).float()
-
-    # heatmap: (B,J,H,W)
     l_h = loss_fn_h(pred_heatmaps, gt_heatmaps)  # (B,J,H,W)
-    loss_h = (l_h * mask_h).sum() / (mask_h.sum().clamp_min(1.0))
+    loss_h = (l_h * mask_h).sum() / mask_h.sum().clamp_min(1.0)
 
-    # angle: (B,A)
-    l_a = loss_fn_a(pred_angles, gt_angles)      # (B,A)
-    loss_a = (l_a * mask_a).sum() / (mask_a.sum().clamp_min(1.0))
+    # 2) Joint Angle Loss (masked)
+    mask_a = (torch.arange(A, device=device)[None, :] < angle_lengths[:, None]).float()
+    l_a = loss_fn_a(pred_angles, gt_angles)  # (B,A)
+    loss_a = (l_a * mask_a).sum() / mask_a.sum().clamp_min(1.0)
 
-    return weight_h * loss_h + weight_a * loss_a
+    # 3) 3D Coordinate Loss (masked)
+    mask_p = (torch.arange(N, device=device)[None, :] < point_lengths[:, None]).float()
+    mask_p = mask_p[:, :, None].expand(-1, -1, 3)  # (B,N,3)
 
+    l_3d = loss_fn_3D(pred_3d, gt_3d)  # (B,N,3) if reduction='none'
+    loss_3d = (l_3d * mask_p).sum() / mask_p.sum().clamp_min(1.0)
+
+    # 4) Weighted Sum
+    total_loss = weight_h * loss_h + weight_a * loss_a + weight_3d * loss_3d
+
+    return total_loss, {
+        'loss_h': loss_h.detach(),
+        'loss_a': loss_a.detach(),
+        'loss_3d': loss_3d.detach()
+    }
 
 def save_checkpoints(checkpoint_data, best_model_state_dict, checkpoint_dir, is_best):
     torch.save(checkpoint_data, os.path.join(checkpoint_dir, "latest_checkpoint.pth"))
@@ -341,24 +609,21 @@ def save_checkpoints(checkpoint_data, best_model_state_dict, checkpoint_dir, is_
         torch.save(best_model_state_dict, os.path.join(checkpoint_dir, "best_model.pth"))
 
 # ======================= 메인 학습 함수 =======================
-def main(args): # args 인자를 받도록 수정
-    # torch.backends.cudnn.benchmark = True
+def main(args): 
     rank, local_rank, world_size = setup_ddp()
-
     save_thread = None
     LEARNING_RATE = 1e-5
     BATCH_SIZE = 198
     EPOCHS = 100
     VAL_RATIO = 0.1
 
-    # --- 1. Ablation 모드에 따른 경로 및 Wandb 설정 ---
     ablation_mode = args.ablation_mode
     WANDB_PROJECT = f"DINOv3_Ablation_total_{ablation_mode}"
     CHECKPOINT_DIR = f"checkpoints_total_{ablation_mode}"
     CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "best_model.pth")
     LATEST_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "latest_checkpoint.pth")
     
-    # 모드에 따라 모델 이름 결정
+    # 모델 이름 결정
     if 'vit' in ablation_mode:
         MODEL_NAME = 'facebook/dinov3-vitb16-pretrain-lvd1689m'
     elif 'conv' in ablation_mode:
@@ -376,12 +641,12 @@ def main(args): # args 인자를 받도록 수정
     model = DINOv3PoseEstimator(dino_model_name=MODEL_NAME, ablation_mode=ablation_mode)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
-    loss_fn_h = nn.MSELoss(reduction='none')
-    loss_fn_a = nn.SmoothL1Loss(reduction='none')
+    loss_fn_h  = nn.MSELoss(reduction='none')
+    loss_fn_a  = nn.SmoothL1Loss(reduction='none')
+    loss_fn_3D = nn.SmoothL1Loss(reduction='none')
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * world_size)
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-8)
-    best_val_loss = float('inf')
     scaler = torch.cuda.amp.GradScaler()
 
     if os.path.exists(LATEST_CHECKPOINT_PATH):
@@ -427,9 +692,11 @@ def main(args): # args 인자를 받도록 수정
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    if rank == 0: print("Loading dataset files...")
+    if rank == 0:
+        print("Loading dataset files...")
     json_files = glob.glob("../dataset/Converted_dataset/**/*.json", recursive=True)
-    if rank == 0: print(f"Found {len(json_files)} files.")
+    if rank == 0:
+        print(f"Found {len(json_files)} files.")
 
     full_dataset = RobotPoseDataset(json_files, transform)
     train_size = int(len(full_dataset) * (1 - VAL_RATIO))
@@ -446,73 +713,141 @@ def main(args): # args 인자를 받도록 수정
     
     if rank == 0:
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-        wandb.init(project="DINOv3_Ablation_Study", name=f"run_total_{ablation_mode}", config={
-            "learning_rate": LEARNING_RATE, "total_batch_size": BATCH_SIZE * world_size,
-            "epochs": EPOCHS, "world_size": world_size, "ablation_mode": ablation_mode
-        }, resume="allow")
-    
-    if rank == 0:
         wandb.init(project=WANDB_PROJECT, name=f"run_total_{ablation_mode}", config={
-            "learning_rate": LEARNING_RATE, "total_batch_size": BATCH_SIZE * world_size,
-            "epochs": EPOCHS, "world_size": world_size, "ablation_mode": ablation_mode
+            "learning_rate": LEARNING_RATE,
+            "total_batch_size": BATCH_SIZE * world_size,
+            "epochs": EPOCHS,
+            "world_size": world_size,
+            "ablation_mode": ablation_mode
         }, resume="allow")
 
-    weight_h = 5.0
-    weight_a = 1.0
+    weight_h, weight_a, weight_3d = 3.0, 1.0, 2.0
 
     for epoch in range(start_epoch, EPOCHS):
         train_loader.sampler.set_epoch(epoch)
         model.train()
         train_loss = 0.0
-        
+
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Train]", disable=(rank != 0))
         for batch in pbar:
-            if batch[0] is None: continue
-            images, gt_heatmaps, gt_angles, joint_lengths, angle_lengths = batch
-            images       = images.to(local_rank)
-            gt_heatmaps  = gt_heatmaps.to(local_rank)
-            gt_angles    = gt_angles.to(local_rank)
-            joint_lengths = joint_lengths.to(local_rank)
-            angle_lengths = angle_lengths.to(local_rank)
+            (images, gt_heatmaps, gt_angles, gt_class, gt_3d_points_padded, K, dist, joint_lengths, angle_lengths, point_lengths) = batch
+
+            images      = images.to(local_rank)
+            gt_heatmaps = gt_heatmaps.to(local_rank)
+            gt_angles   = gt_angles.to(local_rank)
+            gt_3d       = gt_3d_points_padded.to(local_rank)
+            joint_lengths  = joint_lengths.to(local_rank)
+            angle_lengths  = angle_lengths.to(local_rank)
+            point_lengths  = point_lengths.to(local_rank)
+            K          = K.to(local_rank)
+            dist       = dist.to(local_rank)
 
             optimizer.zero_grad(set_to_none=True)
-            
+
             with torch.cuda.amp.autocast():
                 pred_heatmaps, pred_angles = model(images)
-                total_loss = compute_masked_loss(pred_heatmaps, gt_heatmaps, pred_angles, gt_angles, joint_lengths, angle_lengths, loss_fn_h, loss_fn_a, weight_h, weight_a)
+
+                # ---- pred_3d 생성 ----
+                pred_3d_list = []
+                for s in range(images.size(0)):
+                    robot = get_robot_kinematics(gt_class[s])
+                    joint_angles = robot._truncate_angles(pred_angles[s].detach().cpu().numpy())
+                    joint_coords_robot = robot.forward_kinematics(joint_angles)
+
+                    img_kpts2d = gt_heatmaps[s].detach().cpu().numpy().argmax(axis=(1, 2))  # <-- 필요시 points_2d로 교체
+                    K_s        = K[s].detach().cpu().numpy()
+                    dist_s     = dist[s].detach().cpu().numpy()
+
+                    try:
+                        rvec, tvec, ok = solve_pnp_from_fk(joint_coords_robot, img_kpts2d, K_s, dist_s)
+                        if ok:
+                            joint_coords_cam = transform_robot_to_camera(joint_coords_robot, rvec, tvec)
+                        else:
+                            joint_coords_cam = np.zeros_like(joint_coords_robot)
+                    except Exception:
+                        joint_coords_cam = np.zeros_like(joint_coords_robot)
+
+                    pred_3d_list.append(torch.tensor(joint_coords_cam, device=images.device))
+
+                pred_3d = torch.stack(pred_3d_list, dim=0).to(local_rank)
+
+                total_loss, loss_dict = compute_masked_loss(
+                    pred_heatmaps, gt_heatmaps,
+                    pred_angles, gt_angles,
+                    pred_3d, gt_3d,
+                    joint_lengths, angle_lengths, point_lengths,
+                    loss_fn_h, loss_fn_a, loss_fn_3D,
+                    weight_h, weight_a, weight_3d
+                )
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-            train_loss += total_loss.item() / world_size
+            loss_tensor = total_loss.detach().clone()
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            train_loss += loss_tensor.item() / world_size
 
             if rank == 0:
                 pbar.set_postfix(loss=total_loss.item() / world_size)
-        
+
         # --- 검증 루프 ---
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Val]", disable=(rank != 0))
             for batch in val_pbar:
-                if batch[0] is None: continue
-                images, gt_heatmaps, gt_angles, joint_lengths, angle_lengths = batch
-                images       = images.to(local_rank)
-                gt_heatmaps  = gt_heatmaps.to(local_rank)
-                gt_angles    = gt_angles.to(local_rank)
-                joint_lengths = joint_lengths.to(local_rank)
-                angle_lengths = angle_lengths.to(local_rank)
-                
-                # optimizer.zero_grad(set_to_none=True)
-                
+                (images, gt_heatmaps, gt_angles, gt_class, gt_3d_points_padded,
+                joint_lengths, angle_lengths, point_lengths, K, dist) = batch
+
+                images      = images.to(local_rank)
+                gt_heatmaps = gt_heatmaps.to(local_rank)
+                gt_angles   = gt_angles.to(local_rank)
+                gt_3d       = gt_3d_points_padded.to(local_rank)
+                joint_lengths  = joint_lengths.to(local_rank)
+                angle_lengths  = angle_lengths.to(local_rank)
+                point_lengths  = point_lengths.to(local_rank)
+                K          = K.to(local_rank)
+                dist       = dist.to(local_rank)
+
                 with torch.cuda.amp.autocast():
                     pred_heatmaps, pred_angles = model(images)
-                    total_loss = compute_masked_loss(pred_heatmaps, gt_heatmaps, pred_angles, gt_angles, joint_lengths, angle_lengths, loss_fn_h, loss_fn_a, weight_h, weight_a)
-                
-                dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-                val_loss += total_loss.item() / world_size
+
+                    pred_3d_list = []
+                    for s in range(images.size(0)):
+                        robot = get_robot_kinematics(gt_class[s])
+                        joint_angles = robot._truncate_angles(pred_angles[s].detach().cpu().numpy())
+                        joint_coords_robot = robot.forward_kinematics(joint_angles)
+
+                        img_kpts2d = gt_heatmaps[s].detach().cpu().numpy().argmax(axis=(1, 2))  # <-- 필요시 points_2d로 교체
+                        K_s        = K[s].detach().cpu().numpy()
+                        dist_s     = dist[s].detach().cpu().numpy()
+
+                        try:
+                            rvec, tvec, ok = solve_pnp_from_fk(joint_coords_robot, img_kpts2d, K_s, dist_s)
+                            if ok:
+                                joint_coords_cam = transform_robot_to_camera(joint_coords_robot, rvec, tvec)
+                            else:
+                                joint_coords_cam = np.zeros_like(joint_coords_robot)
+                        except Exception:
+                            joint_coords_cam = np.zeros_like(joint_coords_robot)
+
+                    pred_3d_list.append(torch.tensor(joint_coords_cam, device=images.device))
+
+                pred_3d = torch.stack(pred_3d_list, dim=0).to(local_rank)
+
+                total_loss, loss_dict = compute_masked_loss(
+                    pred_heatmaps, gt_heatmaps,
+                    pred_angles, gt_angles,
+                    pred_3d, gt_3d,
+                    joint_lengths, angle_lengths, point_lengths,
+                    loss_fn_h, loss_fn_a, loss_fn_3D,
+                    weight_h, weight_a, weight_3d
+                )
+
+            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+            val_loss += total_loss.item() / world_size
+
         
         scheduler.step()
         
@@ -523,12 +858,13 @@ def main(args): # args 인자를 받도록 수정
             wandb.log({
                 "train_loss": avg_train_loss,
                 "val_loss": avg_val_loss,
+                "loss_h": loss_dict['loss_h'].item(),
+                "loss_a": loss_dict['loss_a'].item(),
+                "loss_3d": loss_dict['loss_3d'].item(),
                 "learning_rate": scheduler.get_last_lr()[0]
             })
 
             print(f"Epoch {epoch+1}/{EPOCHS} -> Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
-
-            # --- 수정된 저장 로직 ---
             is_best = avg_val_loss < best_val_loss
             if is_best:
                 best_val_loss = avg_val_loss
